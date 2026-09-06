@@ -1,0 +1,17 @@
+16:10:26 pair: max_model_len":262144  front: {"ok": true, "front": "pd", "model": "DV4-Flash-MXFP4-MLX"}
+16:10:26 S1 mem before: free 4.5G inactive 106.5G
+16:10:26 A) BRIDGED cold ~246K tokens (seed 801)
+{"url": "http://DECODER_HOST:8012", "seed": 801, "chars": 960041, "ttft_s": 200.3, "total_s": 200.3, "marker": "ZEBRA-0801-6691", "found": true, "answer": "The secret marker is `ZEBRA-0801-6691`.", "bridge": {"skipped": false, "mode": "pooled", "tokens": 241416, "t_tokenize": 0.3, "stamp_seen": 0.21, "t_engine": 137.59, "t_flush_signal": 137.74, "t_done_seen": 155.01, "t_pulled": 157.72, "pulled_gb": 2.378, "t_assembled": 176.74, "boundaries_ok": 117, "B": 239616, "coverage": 0.9925, "verdict": "complete", "blocks": 117, "t_bridge_total": 177.12}}
+16:13:23 bridge(pooled): engine 137.59s, DONE +155.01s, pulled 2.378 GB by +176.74s, blocks 117, verdict complete
+16:13:23 bridge {"skipped": false, "mode": "pooled", "tokens": 241416, "t_tokenize": 0.3, "stamp_seen": 0.21, "t_engine": 137.59, "t_flush_signal": 137.74, "t_done_seen": 155.01, "t_pulled": 157.72, "pulled_gb": 2.378, "t_assembled": 176.74, "boundaries_ok": 117, "B": 239616, "coverage": 0.9925, "ve
+16:13:46 omlx done {"ttfb_omlx": 23.15, "total_omlx": 23.15}
+16:13:46 S1 mem after bridge: free 0.1G inactive 70.3G
+(Worker_TP0 pid=113) [pd_capture_v3 pid=113] finished 20260906-205937-568: 43 layers, T=17524, boundaries=8, calls=129, span=15.424s, write=0.139s, 179.9 MB (idle); enqueue=0.02s worker=3.85s (project 0.72s) items=258 chunks=6 host_syncs=6
+(Worker_TP0 pid=113) [pd_capture_v3 pid=113] finished 20260906-211026-940: 43 layers, T=241416, boundaries=117, calls=1290, span=135.474s, write=4.263s, 2377.1 MB (idle); enqueue=0.10s worker=9.95s (project 1.72s) items=1548 chunks=36 host_syncs=36
+16:13:46 B) NATIVE cold ~246K tokens (seed 802) — Mac alone
+{"url": "http://DECODER_HOST:8011", "seed": 802, "chars": 960041, "ttft_s": 732.3, "total_s": 732.63, "marker": "ZEBRA-0802-2705", "found": true, "answer": "The secret marker is ZEBRA-0802-2705.", "bridge": null}
+2026-09-06 16:13:46,662 - omlx.server - INFO - [-] - Chat completion: model=DV4-Flash-MXFP4-MLX, 15 tokens in 22.65s (39.5 tok/s), prompt: 241416, finish_reason=stop, max_tokens=300, request_max_tokens=300
+2026-09-06 16:25:59,439 - omlx.server - INFO - [-] - Chat completion: model=DV4-Flash-MXFP4-MLX, 14 tokens in 732.07s (40.9 tok/s), prompt: 241155, finish_reason=stop, max_tokens=300, request_max_tokens=300
+16:25:59 C) BRIDGED warm rerun (seed 801) — should self-skip
+{"url": "http://DECODER_HOST:8012", "seed": 801, "chars": 960041, "ttft_s": 19.31, "total_s": 19.31, "marker": "ZEBRA-0801-6691", "found": true, "answer": "The secret marker is `ZEBRA-0801-6691`.", "bridge": {"skipped": true, "tokens": 241416, "cached_prefix": 239616, "tail": 1800, "why": "warm \u2014 new tail 1800 < 8192, oMLX prefills it natively", "t_bridge_total": 0.31}}
+16:26:18 DONE

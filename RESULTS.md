@@ -8,6 +8,22 @@ Inputs are `bench/bench_cold.py`: a deterministic synthetic document built from 
 sources with a seeded shuffle, an embedded marker, and one question. **Each seed is a genuinely cold
 prompt** — no cache clearing, no force switches, nothing either engine has seen.
 
+## The ceiling — 241K tokens, the largest prompt the prefill pair accepts (2026-09-06 16:10–16:26)
+
+vLLM on the Spark pair is built with a 262,144-token window, so ~241K tokens of document plus the question is the
+biggest cold prompt this stack can bridge. One seed each way, decoder otherwise idle, verdict recorded.
+
+| configuration | prompt | time to answer | marker |
+|---|---|---|---|
+| native cold (decoder alone) | 241,155 tok | **732.3 s** | found |
+| **bridged cold** | 241,416 tok | **200.3 s** | found |
+| bridged, warm rerun (bridge self-skips, 239,616 cached) | 241,416 tok | 19.3 s | found |
+
+**3.66× faster to an answer at the ceiling.** Where the 200.3 s went: prefill engine 137.6 s (~1,755 tok/s at this length),
+capture closed +17.4 s after the engine returned (the flush-lag bug), 2.38 GB pulled in 2.7 s, 117 blocks assembled and written by
++176.7 s, decoder first token +23 s. The streaming block writer held 117 boundaries; the decoder went from 4.5 GB free / 106 GB
+inactive to 0.1 GB free / 70 GB inactive during the write and recovered. No memory guard, no swap.
+
 ## The matrix — current code, one sitting (bench6, 2026-09-06 13:31–13:43)
 
 Hook v4 (explicit flush signal + 15 s idle backstop), validating front door, streaming block writer.

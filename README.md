@@ -24,7 +24,8 @@ cold prompt        Mac Studio alone    Sparks prefill -> Mac decode
    ~25K tokens          42.6 s               28.2 s     1.5x
    ~82K tokens         205.8 s               72.9 s     2.8x
   ~105K tokens         245.6 s               75.5 s     3.3x
-decode rate unchanged (23-25 tok/s both ways); warm turns bypass the bridge (4.9 s)
+  ~241K tokens         732.3 s              200.3 s     3.7x   (the prefill pair's 262K window — the ceiling)
+decode rate unchanged (23-25 tok/s both ways); warm turns bypass the bridge (4.9 s / 19.3 s at 241K)
 ```
 
 One sitting, current code, every row verdict-checked (bench6, 2026-09-06). Best ~80K sample to date
