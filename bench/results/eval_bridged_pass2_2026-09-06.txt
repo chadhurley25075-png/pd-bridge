@@ -1,0 +1,32 @@
+13:43:58 front: {"ok": true, "front": "pd", "model": "DV4-Flash-MXFP4-MLX"}
+[37.5s] Q: What are the values of _PENDING_WRITES_TARGET_RAM_FRACTION, 
+   -> '_PENDING_WRITES_TARGET_RAM_FRACTION=0.10\n_PENDING_WRITES_HARD_RAM_FRACTION=0.30\n_PENDING_WRITES_SOFT_FLOOR=32\n_PENDING_WRITES_CEILING=256'
+[5.7s] Q: What are the values of _DEFAULT_BLOCK_SIZE_TOKENS and _DEFAU
+   -> '`_DEFAULT_BLOCK_SIZE_TOKENS = 256` and `_DEFAULT_KV_BYTES_PER_TOKEN = 200_000`.'
+[8.5s] Q: What is the name of the first parameter of _compute_max_pend
+   -> 'The first parameter is `block_size_tokens`, with default value expression `_DEFAULT_BLOCK_SIZE_TOKENS`.'
+[3.3s] Q: What string value is assigned to _PM_LAYOUT_TOKEN?
+   -> '"@pm"'
+[17.3s] Q: List the names of the first five module-level functions (lin
+   -> "1.  The user asks for the first five module-level functions (lines starting with 'def ') in order of appearance.\n2.  I need to scan the provided Python source code for lines that start with `def ` at "
+saved ~/pd_lab/eval_bridge3.json
+13:45:10 eval wall 72s rc=0
+OK  [37.5s] What are the values of _PENDING_WRITES_TARGET_RAM_FRACT -> '_PENDING_WRITES_TARGET_RAM_FRACTION=0.10\n_PENDING_WRITES_HARD_RAM_FRACTION=0.30\n_PENDING_WRITES_SOFT_FLOOR=32\n'
+OK  [5.7s] What are the values of _DEFAULT_BLOCK_SIZE_TOKENS and _ -> '`_DEFAULT_BLOCK_SIZE_TOKENS = 256` and `_DEFAULT_KV_BYTES_PER_TOKEN = 200_000`.'
+OK  [8.5s] What is the name of the first parameter of _compute_max -> 'The first parameter is `block_size_tokens`, with default value expression `_DEFAULT_BLOCK_SIZE_TOKENS`.'
+OK  [3.3s] What string value is assigned to _PM_LAYOUT_TOKEN? -> '"@pm"'
+OK  [17.3s] List the names of the first five module-level functions -> "1.  The user asks for the first five module-level functions (lines starting with 'def ') in order of appearanc"
+BRIDGE score 5/5
+13:43:56 omlx done {"ttfb_omlx": 12.67, "total_omlx": 12.67}
+13:44:22 bridge(pooled): engine 7.1s, DONE +20.31s, pulled 0.153 GB by +23.76s, blocks 7, verdict complete
+13:44:22 bridge {"skipped": false, "mode": "pooled", "tokens": 14786, "t_tokenize": 0.06, "stamp_seen": 0.22, "t_engine": 7.1, "t_flush_signal": 7.11, "t_done_seen": 20.31, "t_pulled": 20.75, "pulled_
+13:44:35 omlx done {"ttfb_omlx": 13.6, "total_omlx": 13.6}
+13:44:35 bridge {"skipped": true, "tokens": 14747, "cached_prefix": 14336, "tail": 411, "why": "warm \u2014 new tail 411 < 8192, oMLX prefills it natively", "t_bridge_total": 0.02}
+13:44:41 omlx done {"ttfb_omlx": 5.64, "total_omlx": 5.64}
+13:44:41 bridge {"skipped": true, "tokens": 14745, "cached_prefix": 14336, "tail": 409, "why": "warm \u2014 new tail 409 < 8192, oMLX prefills it natively", "t_bridge_total": 0.02}
+13:44:50 omlx done {"ttfb_omlx": 8.47, "total_omlx": 8.47}
+13:44:50 bridge {"skipped": true, "tokens": 14734, "cached_prefix": 14336, "tail": 398, "why": "warm \u2014 new tail 398 < 8192, oMLX prefills it natively", "t_bridge_total": 0.02}
+13:44:53 omlx done {"ttfb_omlx": 3.33, "total_omlx": 3.33}
+13:44:53 bridge {"skipped": true, "tokens": 14743, "cached_prefix": 14336, "tail": 407, "why": "warm \u2014 new tail 407 < 8192, oMLX prefills it natively", "t_bridge_total": 0.02}
+13:45:10 omlx done {"ttfb_omlx": 17.29, "total_omlx": 17.29}
+13:45:10 DONE

@@ -1,0 +1,32 @@
+13:43:19 front: {"ok": true, "front": "pd", "model": "DV4-Flash-MXFP4-MLX"}
+[8.5s] Q: What are the values of _PENDING_WRITES_TARGET_RAM_FRACTION, 
+   -> '_PENDING_WRITES_TARGET_RAM_FRACTION=0.10  \n_PENDING_WRITES_HARD_RAM_FRACTION=0.30  \n_PENDING_WRITES_SOFT_FLOOR=32  \n_PENDING_WRITES_CEILING=256'
+[5.7s] Q: What are the values of _DEFAULT_BLOCK_SIZE_TOKENS and _DEFAU
+   -> '`_DEFAULT_BLOCK_SIZE_TOKENS = 256`  \n`_DEFAULT_KV_BYTES_PER_TOKEN = 200_000`'
+[7.0s] Q: What is the name of the first parameter of _compute_max_pend
+   -> 'The first parameter is `block_size_tokens`, and its default value expression is `_DEFAULT_BLOCK_SIZE_TOKENS`.'
+[3.3s] Q: What string value is assigned to _PM_LAYOUT_TOKEN?
+   -> '"@pm"'
+[12.7s] Q: List the names of the first five module-level functions (lin
+   -> '1. `_normalize_kv_bytes_per_token`\n2. `_compute_max_pending_writes`\n3. `_storage_layer_cache_types`\n4. `_canonicalize_layer_cache_types`\n5. `_cache_compat_signature`'
+saved ~/pd_lab/eval_bridge2.json
+13:43:56 eval wall 37s rc=0
+OK  [8.5s] What are the values of _PENDING_WRITES_TARGET_RAM_FRACT -> '_PENDING_WRITES_TARGET_RAM_FRACTION=0.10  \n_PENDING_WRITES_HARD_RAM_FRACTION=0.30  \n_PENDING_WRITES_SOFT_FLOOR'
+OK  [5.7s] What are the values of _DEFAULT_BLOCK_SIZE_TOKENS and _ -> '`_DEFAULT_BLOCK_SIZE_TOKENS = 256`  \n`_DEFAULT_KV_BYTES_PER_TOKEN = 200_000`'
+OK  [7.0s] What is the name of the first parameter of _compute_max -> 'The first parameter is `block_size_tokens`, and its default value expression is `_DEFAULT_BLOCK_SIZE_TOKENS`.'
+OK  [3.3s] What string value is assigned to _PM_LAYOUT_TOKEN? -> '"@pm"'
+OK  [12.7s] List the names of the first five module-level functions -> '1. `_normalize_kv_bytes_per_token`\n2. `_compute_max_pending_writes`\n3. `_storage_layer_cache_types`\n4. `_canon'
+BRIDGE score 5/5
+13:38:31 bridge {"skipped": false, "mode": "pooled", "tokens": 105401, "t_tokenize": 0.11, "stamp_seen": 0.21, "t_engine": 53.66, "t_flush_signal": 53.74, "t_done_seen": 55.03, "t_pulled": 56.27, "pul
+13:38:41 omlx done {"ttfb_omlx": 10.39, "total_omlx": 10.39}
+13:43:19 bridge {"skipped": true, "tokens": 14764, "cached_prefix": 14336, "tail": 428, "why": "warm \u2014 new tail 428 < 8192, oMLX prefills it natively", "t_bridge_total": 0.05}
+13:43:27 omlx done {"ttfb_omlx": 8.43, "total_omlx": 8.43}
+13:43:27 bridge {"skipped": true, "tokens": 14725, "cached_prefix": 14336, "tail": 389, "why": "warm \u2014 new tail 389 < 8192, oMLX prefills it natively", "t_bridge_total": 0.02}
+13:43:33 omlx done {"ttfb_omlx": 5.67, "total_omlx": 5.67}
+13:43:33 bridge {"skipped": true, "tokens": 14723, "cached_prefix": 14336, "tail": 387, "why": "warm \u2014 new tail 387 < 8192, oMLX prefills it natively", "t_bridge_total": 0.02}
+13:43:40 omlx done {"ttfb_omlx": 6.94, "total_omlx": 6.94}
+13:43:40 bridge {"skipped": true, "tokens": 14712, "cached_prefix": 14336, "tail": 376, "why": "warm \u2014 new tail 376 < 8192, oMLX prefills it natively", "t_bridge_total": 0.02}
+13:43:43 omlx done {"ttfb_omlx": 3.31, "total_omlx": 3.31}
+13:43:43 bridge {"skipped": true, "tokens": 14721, "cached_prefix": 14336, "tail": 385, "why": "warm \u2014 new tail 385 < 8192, oMLX prefills it natively", "t_bridge_total": 0.02}
+13:43:56 omlx done {"ttfb_omlx": 12.67, "total_omlx": 12.67}
+13:43:56 DONE

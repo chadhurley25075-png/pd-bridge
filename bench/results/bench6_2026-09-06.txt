@@ -1,0 +1,37 @@
+13:31:31 pair serving
+13:31:31 bench: bridge cold 20K seed 721
+{"url": "http://DECODER_HOST:8012", "seed": 721, "chars": 75041, "ttft_s": 28.17, "total_s": 28.17, "marker": "ZEBRA-0721-9199", "found": true, "answer": "ZEBRA-0721-9199", "bridge": {"skipped": false, "mode": "pooled", "tokens": 24924, "t_tokenize": 0.06, "stamp_seen": 0.22, "t_engine": 17.1, "t_flush_signal": 17.24, "t_done_seen": 17.69, "t_pulled": 18.15, "pulled_gb": 0.254, "t_assembled": 21.91, "boundaries_ok": 12, "B": 24576, "coverage": 0.986, "verdict": "complete", "blocks": 12, "t_bridge_total": 22.01}}
+13:31:59 bench: bridge warm 20K seed 721
+{"url": "http://DECODER_HOST:8012", "seed": 721, "chars": 75041, "ttft_s": 4.87, "total_s": 4.87, "marker": "ZEBRA-0721-9199", "found": true, "answer": "ZEBRA-0721-9199", "bridge": {"skipped": true, "tokens": 24924, "cached_prefix": 24576, "tail": 348, "why": "warm \u2014 new tail 348 < 8192, oMLX prefills it natively", "t_bridge_total": 0.03}}
+13:32:04 bench: native cold 20K seed 722
+{"url": "http://DECODER_HOST:8011", "seed": 722, "chars": 75041, "ttft_s": 42.56, "total_s": 42.93, "marker": "ZEBRA-0722-3362", "found": true, "answer": "ZEBRA-0722-3362", "bridge": null}
+13:32:47 bench: bridge cold 80K seed 723
+{"url": "http://DECODER_HOST:8012", "seed": 723, "chars": 330041, "ttft_s": 72.85, "total_s": 72.85, "marker": "ZEBRA-0723-7402", "found": true, "answer": "ZEBRA-0723-7402", "bridge": {"skipped": false, "mode": "pooled", "tokens": 82505, "t_tokenize": 0.09, "stamp_seen": 0.21, "t_engine": 42.22, "t_flush_signal": 42.32, "t_done_seen": 57.68, "t_pulled": 58.68, "pulled_gb": 0.82, "t_assembled": 66.16, "boundaries_ok": 40, "B": 81920, "coverage": 0.9929, "verdict": "complete", "blocks": 40, "t_bridge_total": 66.31}}
+13:34:00 bench: native cold 80K seed 724
+{"url": "http://DECODER_HOST:8011", "seed": 724, "chars": 330041, "ttft_s": 205.79, "total_s": 206.18, "marker": "ZEBRA-0724-7883", "found": true, "answer": "ZEBRA-0724-7883", "bridge": null}
+13:37:26 bench: bridge cold 100K seed 725
+{"url": "http://DECODER_HOST:8012", "seed": 725, "chars": 410041, "ttft_s": 75.46, "total_s": 75.46, "marker": "ZEBRA-0725-3640", "found": true, "answer": "ZEBRA-0725-3640", "bridge": {"skipped": false, "mode": "pooled", "tokens": 105401, "t_tokenize": 0.11, "stamp_seen": 0.21, "t_engine": 53.66, "t_flush_signal": 53.74, "t_done_seen": 55.03, "t_pulled": 56.27, "pulled_gb": 1.044, "t_assembled": 64.88, "boundaries_ok": 51, "B": 104448, "coverage": 0.991, "verdict": "complete", "blocks": 51, "t_bridge_total": 65.05}}
+13:38:41 bench: native cold 100K seed 726
+{"url": "http://DECODER_HOST:8011", "seed": 726, "chars": 410041, "ttft_s": 245.62, "total_s": 245.98, "marker": "ZEBRA-0726-9106", "found": true, "answer": "ZEBRA-0726-9106.", "bridge": null}
+13:42:47 hook log:
+(EngineCore pid=84) [pd_capture_v3 pid=84] projection weights loaded to host: 43 layers, 0.79 GB in 0.6s (eps=1e-06, ratios=sidecar)
+[pd_capture_v3 pid=111] v3 patched vllm.models.deepseek_v4.attention.DeepseekV4MultiHeadLatentAttentionWrapper.attention_impl (hidden_states -> Mac-weight projections + pooling)
+(Worker pid=111) [pd_capture_v3 pid=111] projection weights loaded to host: 43 layers, 0.79 GB in 0.6s (eps=1e-06, ratios=sidecar)
+(Worker_TP0 pid=111) [pd_capture_v3 pid=111] WARNING non-contiguous positions 0..0 n=16
+(Worker_TP0 pid=111) [pd_capture_v3 pid=111] projection code path: pd_pool_torch.project_layer
+(Worker_TP0 pid=111) [pd_capture_v3 pid=111] WARNING non-contiguous positions 0..0 n=8192
+(Worker_TP0 pid=111) [pd_capture_v3 pid=111] discarded 20260906-183104-442: T=16 < PD_CAPTURE_MIN_T=64 (new-request)
+(Worker_TP0 pid=111) [pd_capture_v3 pid=111] aten-op sample (layer 2, 8192 rows): 108 ops; top {'aten.slice': 52, 'aten.clone': 15, 'aten.cat': 6, 'aten.view': 6, 'aten.mul': 4, 'aten.copy_': 4, 'aten._fused_rms_norm': 3, 'aten.add': 2, 'aten._to_copy': 2, 'aten._softmax': 2, 'aten.sum': 2, 'aten.select': 2}
+(Worker_TP0 pid=111) [pd_capture_v3 pid=111] WARNING non-contiguous positions 0..0 n=8192
+(Worker_TP0 pid=111) [pd_capture_v3 pid=111] finished 20260906-183106-895: 43 layers, T=8192, boundaries=4, calls=43, span=1.414s, write=0.137s, 86.7 MB (new-request); enqueue=0.01s worker=2.78s (project 0.33s) items=87 chunks=3 host_syncs=3
+(Worker_TP0 pid=111) [pd_capture_v3 pid=111] finished 20260906-183110-511: 43 layers, T=8192, boundaries=4, calls=43, span=1.185s, write=0.042s, 86.7 MB (idle); enqueue=0.01s worker=2.99s (project 0.35s) items=129 chunks=3 host_syncs=3
+(Worker_TP0 pid=111) [pd_capture_v3 pid=111] finished 20260906-183131-289: 43 layers, T=24924, boundaries=12, calls=172, span=16.658s, write=0.379s, 254.1 MB (idle); enqueue=0.01s worker=3.76s (project 0.43s) items=301 chunks=7 host_syncs=7
+(Worker_TP0 pid=111) [pd_capture_v3 pid=111] finished 20260906-183247-391: 43 layers, T=82505, boundaries=40, calls=473, span=41.668s, write=0.843s, 819.4 MB (idle); enqueue=0.03s worker=5.17s (project 0.69s) items=774 chunks=18 host_syncs=18
+(Worker_TP0 pid=111) [pd_capture_v3 pid=111] finished 20260906-183726-571: 43 layers, T=105401, boundaries=51, calls=559, span=51.035s, write=1.076s, 1043.0 MB (idle); enqueue=0.04s worker=6.52s (project 1.27s) items=1333 chunks=31 host_syncs=31
+13:42:47 capture manifests:
+20260906-183106-895 T= 8192 calls= 43 werr= 0 partial= None gaps= False flush= new-request
+20260906-183110-511 T= 8192 calls= 43 werr= 0 partial= None gaps= False flush= idle
+20260906-183131-289 T= 24924 calls= 172 werr= 0 partial= None gaps= False flush= idle
+20260906-183247-391 T= 82505 calls= 473 werr= 0 partial= None gaps= False flush= idle
+20260906-183726-571 T= 105401 calls= 559 werr= 0 partial= None gaps= False flush= idle
+13:42:48 DONE
