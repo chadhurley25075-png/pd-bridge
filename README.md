@@ -69,31 +69,34 @@ a bridge-written block can never be byte-identical as a *file*.
 
 ## Known limits — read this before you run it
 
-**There is a hard ceiling at ~82K tokens, and it is a real bug, not caution.**
+**The ~82K-token ceiling was a real bug. It is fixed.** (History kept because the failure mode is
+instructive and the arithmetic still matters on smaller machines.)
 
-`omlx_block_writer` holds one *materialised cumulative* cache snapshot per 2048-token boundary
-until `finalize()`. Peak memory therefore grows **quadratically** with prompt length —
-holding N boundaries costs roughly `N(N+1)/2` blocks' worth of arrays:
+`omlx_block_writer` used to hold one *materialised cumulative* cache snapshot per 2048-token
+boundary until `finalize()`: peak memory grew **quadratically** with prompt length (~`N(N+1)/2`
+blocks' worth of arrays — ~16 GB at 39 boundaries, ~23 GB at 47, which exhausted a 256 GB M3 Ultra
+holding a 156 GB model and wrote zero blocks at 97,848 tokens).
 
-| boundaries | prompt | snapshots held | result on a 256 GB M3 Ultra (156 GB model resident) |
-|---|---|---|---|
-| 39 | 81,024 tok | ~16 GB | works, 63.6 s |
-| 47 | 97,848 tok | ~23 GB | **exhausts headroom, writes 0 blocks** |
+The writer now **streams**: each boundary is stored through oMLX's own pipeline and released the
+moment it is snapshotted (`begin_stream`/`store_boundary`; `finalize` drains and verifies). Peak
+memory is ONE boundary snapshot (~20 MB × boundary index / N — tens of MB, not tens of GB). It is
+validated against a real oMLX reference block (synthetic layout match) and live at 52 boundaries /
+109,085 tokens — see RESULTS.md. `PD_STREAM_BOUNDARIES=0` restores the batched path for comparison.
 
-`PD_MAX_BRIDGE_TOKENS` (default 81920) declines the bridge above the validated envelope and lets
-the decoder serve natively — a clean decision instead of a failure. Raise it only after measuring
-headroom on your own machine; a 512 GB box will go further.
-
-**Fixing this properly is contribution #1** (see *Contributing*): stream each boundary to disk and
-release it, instead of batching every snapshot into one `store_cache` call.
+`PD_MAX_BRIDGE_TOKENS` remains as a configurable envelope guard, not a bug workaround: raise it to
+your machine's measured headroom.
 
 Two related behaviours worth knowing:
 
-- **The fallback works.** When the writer failed at 97,848 tokens the reply still came back correct
-  — `pd_front` caught it and served natively. You lose the speedup, never the answer.
-- **Cold-start variance is real.** The decoder's own first-request model load lands inside whichever
-  leg runs first and can double a measured time. Warm both legs before comparing anything, and see
-  the *Superseded* note in RESULTS.md for what that mistake looked like.
+- **The fallback works, and it can no longer lie.** When a bridge fails the reply still comes back
+  correct — the decoder serves natively. Since the bench4 autopsy (docs/FINDING-bench4-cold-fallback.md),
+  every response carries an `X-PD-Bridge` verdict (`complete` / `partial B/T` / declined with reason),
+  and `bench_cold.py` records it — a silent native fallback can never again enter a results table
+  as a bridged number.
+- **The "cold-start variance" at 20K was not variance.** The 25.5 s vs 55.4 s spread was the capture
+  hook flushing *mid-request* during chunked prefill (see the FINDING): the 55 s runs were native
+  fallbacks wearing a bridge label. The hook now guards its idle flush with a CUDA-event query and a
+  chunk-alignment check, and the front validates every capture manifest before trusting it.
 
 ## Status, honestly
 
@@ -128,6 +131,7 @@ spark/    prefill side (NVIDIA / vLLM)
   pd_pool_validate.py           validate the port against MLX ground truth
   pd-launch-v3.sh               launch vLLM with the hook (PD_HOOK=off for a control run)
   pd_capture_http.py            Range-capable server so the decoder can stream captures
+  pd_share.py                   the threaded share the pooled path actually runs (SimpleHTTP drops connections under poll+fetch)
   pd-hf-layout.sh               lay the checkpoint out as an HF hub dir inside the container mount
   POOL-VALIDATION.md            what the validation numbers mean
 
@@ -144,8 +148,10 @@ studio/   decode side (Apple Silicon / oMLX)
   pd_diff_state.py              cache-array diff against a full forward
   test_block_writer_synthetic.py
 
-bench/    bench_cold.py, BENCHMARK-PROTOCOL.md
+bench/    bench_cold.py (records the X-PD-Bridge verdict), hetero (the one-command demo client),
+          BENCHMARK-PROTOCOL.md
 docs/     DESIGN-v3-pooled.md — the pooling math and the hook points, derived from oMLX's own code
+          FINDING-bench4-cold-fallback.md — the mid-request-flush autopsy; what broke and what it taught
 ```
 
 ## Running it
@@ -171,7 +177,8 @@ prefill nodes.
 ```bash
 ./spark/pd-launch-v3.sh 1     # worker first
 ./spark/pd-launch-v3.sh 0     # then head
-python3 spark/pd_capture_http.py --root "$PD_CAPTURE_DIR" --port 8010
+python3 spark/pd_share.py "$PD_CAPTURE_DIR" 8010        # pooled mode (the one the numbers use)
+# or: python3 spark/pd_capture_http.py --root "$PD_CAPTURE_DIR" --port 8010   # Range-capable; needed by the older 'hidden' pipelined mode
 ```
 
 **3. Patch and start oMLX**, then the front door (on the Mac):
@@ -206,6 +213,12 @@ python3 bench/bench_cold.py --chars 330000 --seed 302 --url http://<decoder>:801
   bf16 ulp from taking those rows out of the 2048-row chunk matmul — MXFP4 kernel tiling. Slice from
   the chunk computation. Relatedly, MLX's bf16 `sum` is serial for 8 rows and 32 strided bf16
   partials combined in f32 for 128 rows; plain f32 accumulation matched only ~50% of elements.
+- **An idle-flush capture hook and chunked prefill are a dangerous pair.** With
+  `--max-num-batched-tokens 8192` the engine grinds ~4 s per chunk; a 2 s idle watcher fires
+  *between* chunks (or inside a chunk's enqueue burst) and ships a DONE manifest for a request that
+  is still running. Guard the flush with a CUDA-event query (GPU busy = mid-request) and a
+  chunk-alignment check (`calls % n_layers == 0`), and make the consumer validate `manifest T ==
+  request T` before trusting any DONE. This cost us a whole benchmark round: docs/FINDING-bench4-cold-fallback.md.
 - **Benchmark with a real token budget.** A 64-token cap truncated answers mid-reasoning and read as
   a retrieval failure on *both* paths.
 
@@ -213,10 +226,8 @@ python3 bench/bench_cold.py --chars 330000 --seed 302 --url http://<decoder>:801
 
 The most useful things anyone could add, roughly in order:
 
-1. **Kill the quadratic snapshot memory** (see *Known limits*). Boundaries should stream to disk and
-   be released as they go, rather than all being held for one `store_cache` call. This is what
-   currently caps the bridge at ~82K tokens on a 256 GB machine, and it is the single most valuable
-   thing anyone could fix.
+1. ~~Kill the quadratic snapshot memory~~ — **done 2026-09-06** (streaming boundary store; see
+   *Known limits* and RESULTS.md). The bridge is validated to 109K tokens on a 256 GB machine.
 2. **A second model.** The bridge shape should generalize to any MLA/sparse-attention model whose
    caches are a pure function of the attention input. Porting the pooling math is the work.
 3. **Stream the capture over a socket** instead of staging it on the prefill node's NVMe.

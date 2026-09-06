@@ -613,25 +613,34 @@ class _Capture:
     def _watch(self):
         while True:
             time.sleep(0.1)
-            with self.lock:
-                r = self.req
-                # 9/6 MID-FLUSH GUARD (FINDING-bench4-cold-fallback.md root cause A): with chunked prefill
-                # (--max-num-batched-tokens 8192) the forward thread enqueues each chunk in a burst, then the GPU
-                # grinds ~4 s per chunk. q.empty() + 2 s idle could fire BETWEEN chunks, flushing a request that
-                # is still running (manifest T = 16384 of 18424 etc.). The last compute-stream event is pending
-                # exactly while the GPU is still inside the request — so an unfinished event means: do not flush.
-                gpu_busy = self.last_ev is not None and not self.last_ev.query()
-                # chunk-alignment guard: a complete forward step ingests one item per layer, so r.calls is a
-                # multiple of the layer count except MID-BURST. seed 705 (9/6): the sentinel landed inside the
-                # final chunk's enqueue burst and split it across two captures (41 orphaned items ->
-                # AssertionError('start_pos 106496 != processed 0'), tail boundary never built).
-                nl = (max(r.kv) + 1) if r.kv else 0
-                aligned = (nl == 0 or r.calls % nl == 0)
-                fire = (r is not None and self.q.empty() and not gpu_busy and aligned
-                        and time.time() - r.last_t >= self.idle_s)
-            if fire:
-                self.q.put(_Capture._FLUSH)
-                time.sleep(self.idle_s)  # one sentinel per idle period
+            try:
+                with self.lock:
+                    r = self.req
+                    if r is None:
+                        continue
+                    # 9/6 MID-FLUSH GUARD (FINDING-bench4-cold-fallback.md root cause A): with chunked prefill
+                    # (--max-num-batched-tokens 8192) the forward thread enqueues each chunk in a burst, then the GPU
+                    # grinds ~4 s per chunk. q.empty() + 2 s idle could fire BETWEEN chunks, flushing a request that
+                    # is still running (manifest T = 16384 of 18424 etc.). The last compute-stream event is pending
+                    # exactly while the GPU is still inside the request — so an unfinished event means: do not flush.
+                    gpu_busy = self.last_ev is not None and not self.last_ev.query()
+                    # chunk-alignment guard: a complete forward step ingests one item per layer, so r.calls is a
+                    # multiple of the layer count except MID-BURST. seed 705 (9/6): the sentinel landed inside the
+                    # final chunk's enqueue burst and split it across two captures (41 orphaned items ->
+                    # AssertionError('start_pos 106496 != processed 0'), tail boundary never built).
+                    # NOTE: r must be None-checked BEFORE any r.* access — the first cut of this guard read
+                    # r.kv unconditionally and killed the watcher thread on every post-flush tick (no idle
+                    # flushes at all; every bridge declined "no captures at all").
+                    nl = (max(r.kv) + 1) if r.kv else 0
+                    aligned = (nl == 0 or r.calls % nl == 0)
+                    fire = (self.q.empty() and not gpu_busy and aligned
+                            and time.time() - r.last_t >= self.idle_s)
+                if fire:
+                    self.q.put(_Capture._FLUSH)
+                    time.sleep(self.idle_s)  # one sentinel per idle period
+            except Exception as e:
+                # the watcher must NEVER die silently: no idle flushes = no captures = every bridge declines
+                _log(f"watcher error (ignored): {e!r}")
 
     def flush(self, reason="manual"):
         """Synchronous flush (tests). Waits until every queued item has been ingested."""
