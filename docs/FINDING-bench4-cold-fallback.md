@@ -1,6 +1,6 @@
 # FINDING — bench4's cold "bridge" numbers are NATIVE FALLBACKS. Do not publish them as bridged.
-Written 2026-09-06 from the ACTUAL logs: the decoder's pd_front.out, the Spark hook lines in the
-chain log, and omlx.server's own completion lines in the bench results. Not from any summary.
+Written 2026-09-06 ~11:50 by Agent A from the ACTUAL logs: S1 ~/pd_front.out,
+Spark hook lines in chain_result.txt, omlx.server lines in v3_bench4_result.txt. Not from any summary.
 
 ## What bench4 actually measured
 | run | label | ttft | what really happened |
@@ -60,3 +60,21 @@ hetero pass1 same: `KeyError: 'kvwin_75776'` (boundary 37/38) at T=78891.
 5. The 20K variance (bench2 25.5s vs bench3/4 55.2s) — bench4's 55.2 was native fallback (46.3s oMLX +
    ~9s failed-bridge overhead), so bench3's "55.4s slow run" is likely the SAME mid-flush bug, not a
    mystery. bench2's 25.5s remains the one genuine cold-20K bridge sample (n=1).
+
+## ADDENDUM (12:55) — the guards alone were NOT enough; the structural fix is FLUSH_NOW
+bench5 (hook v3 = event-query + chunk-alignment guards, idle 2.0s) STILL mid-flushed: seed 713
+flushed at T=16384/16575, calls=86 (2×43, ALIGNED), ev complete — one second BEFORE engine return.
+Between chunks the GPU is genuinely idle >2s (scheduler/IPC gaps): no hook-local signal separates
+"between chunks" from "request finished." Seed 715 repeated it at T=32768/76012 (mid-flush twice;
+orphaned fragment errors 'start_pos 73728 != processed 0').
+**The only party that knows prefill is over is the front door — its engine call returns.** So:
+- pd_share.py: GET /_flush touches FLUSH_NOW in the capture root.
+- hook v4: watcher consumes FLUSH_NOW → immediate flush (once worker drained, still aligned);
+  PD_CAPTURE_IDLE_S default raised 2.0 → 15.0 as backstop (lands inside the front's 45s grace
+  even if the signal fails); idle_s<=0 disables idle entirely.
+- pd_front.py: signals /_flush the moment its engine thread returns; also fixes the salvage-path
+  KeyError('t_done_seen') that mislabeled seed 713's SUCCESSFUL salvage (8 blocks written, warm
+  rerun 6.99s) as bridge_error.
+- pd-launch-v3.sh: PD_CAPTURE_IDLE_S overridable, default 15.0.
+Guards stay (they catch the mid-burst split, root cause B). bench6 (chain2.sh, ~13:45) is the
+validation: expect verdict=complete at 20K/80K/100K with t_flush_signal ≈ t_engine + 0.2s.
