@@ -172,6 +172,27 @@ docs/     DESIGN-v3-pooled.md — the pooling math and the hook points, derived 
           FINDING-bench4-cold-fallback.md — the mid-request-flush autopsy; what broke and what it taught
 ```
 
+## Don't have this hardware? Read this before you leave
+
+The numbers above need two DGX Sparks and a 256 GB Mac Studio. **The idea does not.** Strip it to what it
+actually requires:
+
+| what the bridge needs | what we used | what would also work |
+|---|---|---|
+| a prefill box with a CUDA engine you can hook | 2× DGX Spark, vLLM | one used gaming GPU (8–24 GB) running vLLM or sglang with a smaller MLA model |
+| a decode box with an on-disk, content-addressed prefix cache | Mac Studio M3 Ultra, oMLX | any Apple Silicon Mac with enough unified memory for the model, oMLX |
+| a model whose per-layer cache is a pure function of the attention input, with a compact (MLA-style) cache | DeepSeek-V4-Flash, 284B | **DeepSeek-V2-Lite (16B, MLA)** is the obvious small candidate; anything MLA-latent that fits both boxes |
+| a wire | 10 GbE through a switch | the Ethernet you have; ~10 KB/token means 1 GbE moves a 30K-token prompt in ~0.3 s |
+
+What changes at small scale is honest and worth saying: the win is the *ratio* of prefill speeds. A used
+3090 prefills a 16B MLA model far faster than a 16 GB Mac does, so the shape of the result holds; the
+absolute numbers will be smaller because the prompts and models are smaller. The porting guide's two-question
+feasibility test (`docs/PORTING.md`) tells you in ten minutes whether your pair qualifies. **We have not run
+the cheap pair ourselves.** It is the first port we want to see, and a negative result is a result — open an
+issue either way.
+
+The point of this repo is that the privilege travels down. Take it apart.
+
 ## Running it
 
 ### Prerequisites
@@ -182,7 +203,24 @@ docs/     DESIGN-v3-pooled.md — the pooling math and the hook points, derived 
 | decode | 1× Mac Studio M3 Ultra, 256 GB | oMLX 0.6.4 in a venv + the one-file patch in `studio/` | an MLX MXFP4-experts / MXFP8-attention conversion of `deepseek-ai/DeepSeek-V4-Flash-0731` (~156 GB; any bit-exact conversion works — ours keeps the DSpark MTP heads) |
 | link | any Ethernet ≥10 GbE between the two | SSH key from the Mac to the prefill head; Python 3.10+ on both | — |
 
-One prefill node also works (TP1) if the FP8 checkpoint fits; the numbers in RESULTS.md are TP2.
+The official FP8 checkpoint is ~149 GB, so it does **not** fit one 128 GB Spark: prefill is tensor-parallel
+across two Sparks over their direct ConnectX-7 link (the standard two-Spark cable — box to box, no switch
+involved). The only traffic that crosses to the Mac is HTTP over ordinary Ethernet, through whatever switch
+you have. The numbers in RESULTS.md are TP2 over a 10 GbE LAN.
+
+**The Mac-side model.** We run a local, bit-exact MLX conversion of `deepseek-ai/DeepSeek-V4-Flash-0731`
+(MXFP4 experts, MXFP8 attention, DSpark MTP heads kept). There is no single published id to point at, so
+produce your own; the closest one-liner is
+
+```bash
+mlx_lm.convert --hf-path deepseek-ai/DeepSeek-V4-Flash-0731 --mlx-path ~/models/DV4-Flash-MXFP4-MLX \
+  -q --q-mode mxfp4 --q-bits 4 --q-group-size 32
+```
+
+(unverified by us end to end — our build was a mixed conversion). What matters for the bridge is
+**self-consistency**, not which conversion: `make weights` exports the attention-projection weights from
+*your* MLX model, and the prefill hook uses exactly those, so the pooled tensors match whatever the decoder
+actually runs.
 
 ```bash
 cp config.example.env config.env && $EDITOR config.env   # nothing has a working default
