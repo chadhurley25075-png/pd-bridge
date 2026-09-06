@@ -6,7 +6,7 @@ window 128; even layers >=2 CacheList(Rotating, PoolingCache(4) D=512,
 PoolingCache(4) D=128); odd layers >=3 CacheList(Rotating, PoolingCache(128)
 D=512)) with random bf16 state at two boundaries (2048, 4096), writes blocks
 through oMLX's own store path, and checks the files' layout against a real
-reference block written by S1.
+reference block written by the decoder (oMLX).
 
 Run:  $OMLX_PYTHON test_block_writer_synthetic.py --ref <ref_block.safetensors> --out /tmp/pd_blocks_test
 """

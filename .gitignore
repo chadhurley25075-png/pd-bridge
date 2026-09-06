@@ -8,3 +8,4 @@ blocks*/
 captures/
 pd_pull/
 *.jsonl
+.scrub-private

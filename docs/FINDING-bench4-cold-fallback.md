@@ -1,5 +1,5 @@
 # FINDING — bench4's cold "bridge" numbers are NATIVE FALLBACKS. Do not publish them as bridged.
-Written 2026-09-06 ~11:50 by Agent A from the ACTUAL logs: S1 ~/pd_front.out,
+Written 2026-09-06 ~11:50 by Agent A from the ACTUAL logs: the decoder's ~/pd_front.out,
 Spark hook lines in chain_result.txt, omlx.server lines in v3_bench4_result.txt. Not from any summary.
 
 ## What bench4 actually measured

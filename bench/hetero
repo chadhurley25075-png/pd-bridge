@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # hetero — ask the model served HETEROGENEOUSLY: prefill on the Spark pair (vLLM, CUDA), decode on the Mac Studio (oMLX, Metal).
-# Plain OpenAI-compatible client, no Compass prompt, no hooks. Shows what the bridge did (cold → Sparks; warm → Mac alone) and the timings.
+# Plain OpenAI-compatible client, no system prompt, no hooks. Shows what the bridge did (cold → Sparks; warm → Mac alone) and the timings.
 #   hetero "question"                          short question (warm/short prompts go straight to the Mac — that's by design)
 #   hetero --file big.md "summarize this"      long document → cold prompt → Sparks prefill → Mac decode
 #   hetero --native ...                        same request straight to oMLX (:8011) for an A/B

@@ -280,7 +280,7 @@ class BlockWriter:
         out_dir: str | os.PathLike,
         cache_list_factory,
         block_size: int = BLOCK_SIZE,
-        gdn_ssd_split_enabled: bool = True,  # S1 stamps version 5 / split_recurrent_v1
+        gdn_ssd_split_enabled: bool = True,  # oMLX 0.6.4 stamps version 5 / split_recurrent_v1
         max_size_bytes: int = 200 * 1024**3,
     ):
         self.model_name = model_name
@@ -318,7 +318,7 @@ class BlockWriter:
     def add_extracted_snapshot(self, token_count: int, extracted: list[dict[str, Any]]) -> None:
         self.snapshots[token_count] = extracted
 
-    # -- incremental streaming (9/6, qwenmax seat): the assemble path can store each boundary THE MOMENT it
+    # -- incremental streaming (9/6): the assemble path can store each boundary THE MOMENT it
     # is snapshotted, so peak memory is ONE boundary snapshot (~20 MB * boundary index / N) instead of the
     # whole N(N+1)/2 accumulation. This is what lets a 100K-token capture (51 boundaries) fit beside a
     # 156 GB resident model. finalize() transparently handles a mix of already-stored and pending snapshots.

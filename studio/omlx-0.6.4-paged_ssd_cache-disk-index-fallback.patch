@@ -11,7 +11,7 @@
 +        return found
 +
 +    def _pd_index_from_disk(self, block_hash: bytes):
-+        """Compass 2026-09-06 (heterogeneous P/D): the startup scan is the only
++        """pd-bridge 2026-09-06 (heterogeneous P/D): the startup scan is the only
 +        indexer upstream, so blocks written by an external producer (the Spark
 +        prefill bridge) were invisible until restart. On an index miss, look for
 +        the file on disk, validate it with the same reader + compatibility check
