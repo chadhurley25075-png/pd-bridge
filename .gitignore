@@ -1,0 +1,10 @@
+config.env
+__pycache__/
+*.pyc
+*.safetensors
+*.bin
+*.log
+blocks*/
+captures/
+pd_pull/
+*.jsonl
