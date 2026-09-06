@@ -1,0 +1,21 @@
+17:39:54 deploying e25b2a5da4c7 to the prefill pair ~/pd_v3/ (backups .bak-v4-flushlag)
+e25b2a5da4c7
+e25b2a5da4c7
+17:39:54 pair restart
+17:52:39 pair serving after 751s
+17:52:39 bench: 20K seed 831
+{"url": "http://DECODER_HOST:8012", "seed": 831, "chars": 75041, "ttft_s": 17.15, "total_s": 17.15, "marker": "ZEBRA-0831-3316", "found": true, "answer": "The secret marker is ZEBRA-0831-3316.", "bridge": {"skipped": false, "mode": "pooled", "tokens": 17095, "t_tokenize": 0.05, "stamp_seen": 0.22, "t_engine": 8.67, "t_flush_signal": 8.84, "t_done_seen": 9.28, "t_pulled": 9.65, "pulled_gb": 0.176, "t_assembled": 13.4, "boundaries_ok": 8, "B": 16384, "coverage": 0.9584, "verdict": "complete", "blocks": 8, "t_bridge_total": 13.5}}
+17:52:56 bench: 82K seed 833
+{"url": "http://DECODER_HOST:8012", "seed": 833, "chars": 330041, "ttft_s": 56.44, "total_s": 56.44, "marker": "ZEBRA-0833-1131", "found": true, "answer": "The secret marker is ZEBRA-0833-1131.", "bridge": {"skipped": false, "mode": "pooled", "tokens": 79314, "t_tokenize": 0.09, "stamp_seen": 0.22, "t_engine": 40.14, "t_flush_signal": 40.19, "t_done_seen": 41.06, "t_pulled": 42.14, "pulled_gb": 0.786, "t_assembled": 49.28, "boundaries_ok": 38, "B": 77824, "coverage": 0.9812, "verdict": "complete", "blocks": 38, "t_bridge_total": 49.43}}
+17:53:53 bench: 241K seed 835
+{"url": "http://DECODER_HOST:8012", "seed": 835, "chars": 960041, "ttft_s": 187.61, "total_s": 187.62, "marker": "ZEBRA-0835-4159", "found": true, "answer": "The secret marker is ZEBRA-0835-4159.", "bridge": {"skipped": false, "mode": "pooled", "tokens": 236377, "t_tokenize": 0.27, "stamp_seen": 0.23, "t_engine": 135.89, "t_flush_signal": 135.97, "t_done_seen": 140.68, "t_pulled": 143.15, "pulled_gb": 2.335, "t_assembled": 161.9, "boundaries_ok": 115, "B": 235520, "coverage": 0.9964, "verdict": "complete", "blocks": 115, "t_bridge_total": 162.26}}
+17:57:01 hook decision lines:
+(Worker_TP0 pid=111) [pd_capture_v3 pid=111] flush decision: fire=1 reason=idle — signal=none q_empty=True gpu_busy=False aligned=True calls=43 nl=43 idle_for=15.10s idle_s=15.0 req=20260906-225221-948
+(Worker_TP0 pid=111) [pd_capture_v3 pid=111] finished 20260906-225221-948: 43 layers, T=8192, boundaries=4, calls=43, span=1.115s, write=0.043s, 86.7 MB (idle); enqueue=0.01s worker=3.18s (project 0.39s) items=129 chunks=3 host_syncs=3
+(Worker_TP0 pid=111) [pd_capture_v3 pid=111] flush decision: fire=1 reason=flush_now — signal=0.05s old q_empty=True gpu_busy=False aligned=True calls=129 nl=43 idle_for=0.66s idle_s=15.0 req=20260906-225239-883
+(Worker_TP0 pid=111) [pd_capture_v3 pid=111] finished 20260906-225239-883: 43 layers, T=17095, boundaries=8, calls=129, span=8.161s, write=0.172s, 175.4 MB (flush_now); enqueue=0.01s worker=3.63s (project 0.56s) items=258 chunks=6 host_sync
+(Worker_TP0 pid=111) [pd_capture_v3 pid=111] flush decision: fire=1 reason=flush_now — signal=0.03s old q_empty=True gpu_busy=False aligned=True calls=430 nl=43 idle_for=2.15s idle_s=15.0 req=20260906-225257-131
+(Worker_TP0 pid=111) [pd_capture_v3 pid=111] finished 20260906-225257-131: 43 layers, T=79314, boundaries=38, calls=430, span=37.979s, write=0.771s, 785.8 MB (flush_now); enqueue=0.02s worker=5.15s (project 0.80s) items=688 chunks=16 host_s
+(Worker_TP0 pid=111) [pd_capture_v3 pid=111] flush decision: fire=1 reason=flush_now — signal=0.08s old q_empty=True gpu_busy=False aligned=True calls=1247 nl=43 idle_for=2.25s idle_s=15.0 req=20260906-225353-883
+(Worker_TP0 pid=111) [pd_capture_v3 pid=111] finished 20260906-225353-883: 43 layers, T=236377, boundaries=115, calls=1247, span=133.685s, write=4.526s, 2333.7 MB (flush_now); enqueue=0.08s worker=12.49s (project 4.35s) items=1935 chunks=45
+17:57:01 DONE

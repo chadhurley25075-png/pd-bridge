@@ -28,8 +28,8 @@ cold prompt        Mac Studio alone    Sparks prefill -> Mac decode
 decode rate unchanged (23-25 tok/s both ways); warm turns bypass the bridge (4.9 s / 19.3 s at 241K)
 ```
 
-One sitting, current code, every row verdict-checked (bench6, 2026-09-06). Best ~80K sample to date
-is 63.6 s (3.07×); the 72.9 s row above paid a 15 s flush lag that is a known hook bug, not a limit.
+Every row verdict-checked, 2026-09-06. The 17K/79K/236K rows are hook v5, after the flush-signal fix landed
+the same afternoon (`docs/FINDING-flush-signal-three-watchers.md`); the 105K row predates it.
 The bridged leg scores **5/5 on the judged quality eval**, same as native. **Validated envelope is
 ~20K-105K tokens** — see *Known limits* below, which is where you should look before believing
 anything above.
@@ -126,10 +126,10 @@ This is a **reference implementation, not a library.** It is pinned hard and it 
   twice (once from a fresh cold v3 bridge), same as native. Prefill runs FP8 weights and decode runs
   MXFP4, so bridged output is *not* token-identical to native; it is factually faithful on what we
   checked, which is a smaller claim than "equivalent".
-- **The flush signal is not reliable yet.** The front door tells the Spark hook when the prefill engine
-  has returned; in 2 of 4 bridged runs on 2026-09-06 the hook missed it and closed the capture on its
-  15 s idle backstop instead (82K: +15.5 s; 14.8K: +13.2 s). Correct, just slower. The fix is on the hook
-  side (`capture_sitecustomize_v3.py`, the `FLUSH_NOW` consumer) and is the best first contribution.
+- **The flush signal was unreliable until 2026-09-06 17:52 — fixed.** The hook's watcher ran in three
+  processes and two of them deleted the signal before the capturing worker saw it (~1 in 3 hit rate). Hook v5
+  fixes it; captures now close 0.6–0.9 s after the engine returns (4.8 s at 236K, which is the block write).
+  Autopsy: `docs/FINDING-flush-signal-three-watchers.md`. Unit test: `spark/test_flush_decision.py`.
 - **The front door is single-threaded.** One request at a time; a second caller queues behind a bridge
   in flight and `/health` goes silent while the port stays open. Busy is not down.
 - Only cold, long prompts benefit. Warm turns bypass the bridge by design and are served natively.

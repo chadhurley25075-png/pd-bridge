@@ -48,12 +48,11 @@ eval is contribution #5 in the README list and the last thing standing between "
 
 ## Ports we want first
 
-1. **The flush-signal fix** in `spark/capture_sitecustomize_v3.py` (see AGENTS.md) with a verdict-tagged matrix.
-2. **The cheap pair**: DeepSeek-V2-Lite (or any small MLA-latent model) on a used gaming GPU + a 16–32 GB
+1. **The cheap pair**: DeepSeek-V2-Lite (or any small MLA-latent model) on a used gaming GPU + a 16–32 GB
    Apple Silicon Mac. Same recipe, your numbers. This is the port that makes the idea useful to people
    without a rack, and we will feature it here.
-3. A second decode engine (vLLM CPU/disk KV connector; llama.cpp prompt-cache — harder, see PORTING).
-4. Multi-stream front door.
+2. A second decode engine (vLLM CPU/disk KV connector; llama.cpp prompt-cache — harder, see PORTING).
+3. Multi-stream front door.
 
 If you are an AI agent working on this: read `AGENTS.md` first. If you are a kid with an old iMac and a
 beat gaming PC: that is exactly who this is for. Say so in the issue.

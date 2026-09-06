@@ -8,7 +8,24 @@ Inputs are `bench/bench_cold.py`: a deterministic synthetic document built from 
 sources with a seeded shuffle, an embedded marker, and one question. **Each seed is a genuinely cold
 prompt** — no cache clearing, no force switches, nothing either engine has seen.
 
-## The ceiling — 241K tokens, the largest prompt the prefill pair accepts (2026-09-06 16:10–16:26)
+## After the flush fix — the current numbers (2026-09-06 17:52–17:57, hook v5)
+
+The flush-lag bug described below was root-caused and fixed the same afternoon (two agents, independent, same
+finding: `docs/FINDING-flush-signal-three-watchers.md`). The capture hook's watcher thread ran in three processes
+inside the vLLM container; the two that never own a capture deleted the front door's one-shot `FLUSH_NOW` signal on
+sight, so the capturing process saw it on about one run in three and fell back to its 15 s idle timer otherwise.
+Hook v5 starts the watcher only in the capturing worker, never consumes a signal it cannot act on, and tags the
+manifest with the real reason (`flush_now` vs `idle`). One seed per size, fresh, verdict recorded:
+
+| cold prompt | native (earlier today) | **bridged, hook v5** | signal → capture closed | gain |
+|---|---|---|---|---|
+| 17,095 tok | 42.6 s | **17.2 s** | 0.6 s | 2.5× |
+| 79,314 tok | 205.8 s | **56.4 s** | 0.9 s | 3.65× |
+| 236,377 tok | 732.3 s | **187.6 s** | 4.8 s (4.5 s of it is the 2.3 GB write — the floor) | 3.9× |
+
+Every capture closed on `flush_now`, from the capturing worker only, 0.03–0.08 s after the signal landed.
+
+## The ceiling — 241K tokens, the largest prompt the prefill pair accepts (2026-09-06 16:10–16:26, hook v4 — before the flush fix)
 
 vLLM on the Spark pair is built with a 262,144-token window, so ~241K tokens of document plus the question is the
 biggest cold prompt this stack can bridge. One seed each way, decoder otherwise idle, verdict recorded.
