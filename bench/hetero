@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# hetero — ask the model served HETEROGENEOUSLY: prefill on the Spark pair (vLLM, CUDA), decode on the Mac Studio (oMLX, Metal).
+# Plain OpenAI-compatible client, no Compass prompt, no hooks. Shows what the bridge did (cold → Sparks; warm → Mac alone) and the timings.
+#   hetero "question"                          short question (warm/short prompts go straight to the Mac — that's by design)
+#   hetero --file big.md "summarize this"      long document → cold prompt → Sparks prefill → Mac decode
+#   hetero --native ...                        same request straight to oMLX (:8011) for an A/B
+#   hetero --max-tokens N | --model NAME       defaults: 600 · DV4-Flash-MXFP4-MLX
+FRONT="${HETERO_FRONT:-http://127.0.0.1:8012}"; NATIVE="${HETERO_NATIVE:-http://127.0.0.1:8011}"   # set these to your decoder's address
+exec python3 - "$FRONT" "$NATIVE" "$@" <<'PY'
+import sys, json, time, urllib.request, os
+front, native, *args = sys.argv[1:]
+url=front; files=[]; max_tokens=600; model="DV4-Flash-MXFP4-MLX"; q=[]
+i=0
+while i < len(args):
+    a=args[i]
+    if a=="--native": url=native
+    elif a=="--file": i+=1; files.append(args[i])
+    elif a=="--max-tokens": i+=1; max_tokens=int(args[i])
+    elif a=="--model": i+=1; model=args[i]
+    else: q.append(a)
+    i+=1
+question=" ".join(q).strip()
+if not question and not files:
+    print(__doc__ or "usage: hetero [--file PATH]... [--native] [--max-tokens N] question"); sys.exit(2)
+content=""
+for f in files:
+    content+=f"\n\n### FILE {os.path.basename(f)}\n"+open(f,encoding="utf-8",errors="ignore").read()
+content=(content+"\n\n"+question).strip() if content else question
+body=json.dumps({"model":model,"messages":[{"role":"user","content":content}],"max_tokens":max_tokens,"temperature":0,"stream":True}).encode()
+t0=time.time(); first=None; ntok=0
+try:
+    r=urllib.request.urlopen(urllib.request.Request(url+"/v1/chat/completions",body,{"Content-Type":"application/json"}),timeout=3600)
+except Exception as e:
+    print(f"hetero: {url} unreachable ({e})", file=sys.stderr); sys.exit(1)
+bridge=r.headers.get("X-PD-Bridge")
+for line in r:
+    if not line.startswith(b"data: ") or line.strip()==b"data: [DONE]": continue
+    try: d=json.loads(line[6:])
+    except Exception: continue
+    delta=d.get("choices",[{}])[0].get("delta",{})
+    c=delta.get("content")
+    if c:
+        if first is None: first=time.time()-t0; print()
+        sys.stdout.write(c); sys.stdout.flush(); ntok+=1
+tot=time.time()-t0
+print("\n")
+if bridge:
+    b=json.loads(bridge)
+    if b.get("bridge_error"): where=f"FELL BACK to Mac native — bridge declined/failed: {str(b.get('bridge_error'))[:200]}"
+    elif b.get("skipped"): where=f"Mac alone (warm: {b.get('cached_prefix',0):,} of {b.get('tokens',0):,} tokens already cached)" if b.get("cached_prefix") else f"Mac alone ({b.get('why','short prompt')})"
+    else: where=f"Sparks prefill → Mac decode: {b.get('tokens',0):,} tokens, Spark {b.get('t_engine')}s, capture {b.get('pulled_gb')} GB, blocks {b.get('blocks')} by {b.get('t_assembled')}s, verdict {b.get('verdict','n/a')}"
+    print(f"[hetero] {where}")
+else:
+    print(f"[hetero] {'native oMLX' if url==native else 'front door (no bridge header)'}")
+print(f"[hetero] first token {first if first is not None else -1:.1f}s · total {tot:.1f}s · {ntok} chunks · {url}")
+PY

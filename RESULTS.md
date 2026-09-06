@@ -46,9 +46,14 @@ The prefill engine is 65% of wall time. Transport is 1.7%.
 | | tok/s |
 |---|---|
 | decoder alone (Apple Silicon, MXFP4) | 423 |
-| prefill pair (2× GB10, TP2, FP8, hook on) | 1,944 |
+| prefill pair (2× GB10, TP2, FP8, hook on) | 1,944–2,077 |
+| prefill pair, **hook off** (control run, 9/6) | 2,017–2,077 (median ~2,050) |
 
-**4.6×**, consistent at 19K and 81K.
+**~4.6–4.9×** over the decoder. The control run — the pair restarted with `PD_HOOK=off` and the same
+neutral prompts — puts the honest prefill floor at **~2,050 tok/s**: the capture hook now costs
+single-digit percent (39.35 s hook-off vs 39.63–40.77 s hook-on at ~78–81K). The earlier v3.0 hook
+cost ~33 s per request; v3.1's launch-lean data path removed it. An earlier "~8 s pure prefill at
+81K" estimate was wrong by 5× and never measured — the control run is the measurement.
 
 ## Payload
 
@@ -71,7 +76,7 @@ the prefill node removed it. The `hidden` mode is still in `pd_front.py` for com
 | hook selftest, chunked vs. one-shot | 52/52 |
 | marker retrieval, bridged and native, both sizes | 6/6 |
 
-## The ceiling, and the run that found it
+## The ceiling — found, root-caused, and cured
 
 A third benchmark round pushed past 81K and hit a hard wall:
 
@@ -81,18 +86,45 @@ A third benchmark round pushed past 81K and hit a hard wall:
 | 97,848 tok | bridged | **fails.** `RuntimeError: 47 block files not written`; fell back to native. Client saw 905 s |
 | 100,083 tok | native cold | 259.9 s (decode degraded to 4.6 tok/s — the machine was out of headroom) |
 
-Cause: the block writer holds one materialised cumulative snapshot per boundary until `finalize()`,
-so peak memory is quadratic in prompt length (~16 GB at 39 boundaries, ~23 GB at 47). On a 256 GB
-machine with a 156 GB model resident, 47 boundaries exhausts the headroom.
+Cause: the block writer held one materialised cumulative snapshot per boundary until `finalize()`,
+so peak memory was quadratic in prompt length (~16 GB at 39 boundaries, ~23 GB at 47). On a 256 GB
+machine with a 156 GB model resident, 47 boundaries exhausted the headroom.
 
-Two fixes are in the code as shipped: `PD_MAX_BRIDGE_TOKENS` (default 81920) declines the bridge
-above the validated envelope, and `_drain` now aborts after 30 s without progress instead of burning
-its full timeout — that timeout is what turned a failed write into an 11-minute stall.
+**The cure shipped the same day.** The writer now streams: each boundary is stored through oMLX's
+own pipeline and released the moment it is snapshotted, and the assemble path stores incrementally,
+so peak memory is ONE boundary snapshot instead of N(N+1)/2 of them. Validated two ways before going
+live: the synthetic writer test (two boundaries through the streaming path, hash chain + tensor
+layout matching a real oMLX reference block), and live at **52 boundaries / 109,085 tokens — the
+first 100K+ bridge to work** (83.5 s to first token against 256.8 s native, with the tail salvaged
+from a capture that lost its last boundary — see the autopsy below). `PD_MAX_BRIDGE_TOKENS` stays as
+a configurable envelope guard; the bug ceiling is gone.
 
-**The same round also showed cold-start variance at 20K**: 25.5 s bridged in one run, 55.4 s in
-another, against a stable ~44 s native. In the slow run the decoder spent 43.7 s despite holding a
-valid prefix hit, with decode healthy at 26.1 tok/s. That is not explained yet. Treat the 19-20K
-figures as provisional; the ~80K figures reproduced twice and are the ones we stand behind.
+## The bench4 autopsy — why a whole round of "bridge" numbers was actually native
+
+The fourth benchmark round reported cold bridge runs of 55 s (20K), 220 s (80K) and 327 s (100K).
+Every one of them was a **native fallback wearing a bridge label**: the decoder's own server log
+shows it prefilling the full prompt (46.2 s / 202.2 s / 269.7 s), and the front door's failure lines
+show why. Two bugs, one disease — the capture hook's 2-second idle flush racing a chunked prefill
+(`--max-num-batched-tokens 8192`, ~4 s of GPU per chunk):
+
+- **A — mid-request flush.** The watcher fired between chunks and wrote DONE with `manifest T` =
+  tokens-so-far (16,384 of 18,424; 32,768 of 82,703). The front correctly refused the mismatched
+  capture, then silently served natively.
+- **B — split final chunk.** The flush sentinel landed *inside* the final chunk's 43-item enqueue
+  burst, splitting one chunk across two captures: a T-correct manifest with missing tail-boundary
+  windows (`KeyError: kvwin_108544` live) and 41 orphaned-item assertions per event.
+
+Four fixes, all in this tree: the hook guards its idle flush with a CUDA-event query (GPU busy =
+mid-request) and a chunk-alignment check; the front validates every DONE manifest (`T` match, no
+`partial_start`, no `position_gaps`) and keeps scanning until the engine returns + a grace window;
+a missing tail is **salvaged** — the longest contiguous boundary prefix is assembled and written, so
+the decoder prefix-hits at B and natively prefills only the remainder (this turned a 327 s failure
+into an 83.5 s partial win at 109K); and a bridge that cannot be trusted **declines loudly**, with
+the verdict (`complete` / `partial B/T` / declined + reason) in the `X-PD-Bridge` response header,
+which `bench_cold.py` now records. Full detail: docs/FINDING-bench4-cold-fallback.md.
+
+The same autopsy explains the "unexplained 20K variance" from the previous round (25.5 s vs 55.4 s):
+the slow runs were this bug. The 25.5 s sample was genuine.
 
 ## What these numbers do not show
 
