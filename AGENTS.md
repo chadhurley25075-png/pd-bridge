@@ -63,10 +63,9 @@ in the watcher thread). Fix that and the ~80K bridged time drops from ~73 s to ~
 ## What we would love to see next (in order)
 
 1. The flush-signal fix above, with a bench6-style matrix proving it.
-2. **A cheap pair.** A small MLA-latent model (DeepSeek-V2-Lite is the obvious candidate) on a used
-   gaming GPU for prefill and a 16–32 GB Apple Silicon Mac for decode. The recipe is the same; the
-   numbers will be different and we want to see them either way. See README → *Don't have this
-   hardware?*
+2. **Rung B or C from the README ladder.** One Spark + an iMac, or a used gaming GPU + an M-series
+   Mac, with a small MLA-latent model (DeepSeek-V2-Lite is the obvious candidate). Same recipe, your
+   numbers, either way. See README → *Don't have this hardware? Start on the rung you can reach*.
 3. A second decode engine (vLLM's CPU/disk KV connector, or llama.cpp's prompt cache — the latter is
    harder, see PORTING).
 4. Multi-stream: the front door is single-threaded today.

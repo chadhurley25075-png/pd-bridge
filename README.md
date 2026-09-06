@@ -172,24 +172,30 @@ docs/     DESIGN-v3-pooled.md — the pooling math and the hook points, derived 
           FINDING-bench4-cold-fallback.md — the mid-request-flush autopsy; what broke and what it taught
 ```
 
-## Don't have this hardware? Read this before you leave
+## Don't have this hardware? Start on the rung you can reach
 
-The numbers above need two DGX Sparks and a 256 GB Mac Studio. **The idea does not.** Strip it to what it
-actually requires:
+Everything in this repo is written against the exact machines we ran, on purpose: if you have the same
+gear you get an exact replica and the numbers in RESULTS.md. If you don't, the idea is the same and the
+recipe scales down. Three rungs, honestly labeled:
 
-| what the bridge needs | what we used | what would also work |
-|---|---|---|
-| a prefill box with a CUDA engine you can hook | 2× DGX Spark, vLLM | one used gaming GPU (8–24 GB) running vLLM or sglang with a smaller MLA model |
-| a decode box with an on-disk, content-addressed prefix cache | Mac Studio M3 Ultra, oMLX | any Apple Silicon Mac with enough unified memory for the model, oMLX |
-| a model whose per-layer cache is a pure function of the attention input, with a compact (MLA-style) cache | DeepSeek-V4-Flash, 284B | **DeepSeek-V2-Lite (16B, MLA)** is the obvious small candidate; anything MLA-latent that fits both boxes |
-| a wire | 10 GbE through a switch | the Ethernet you have; ~10 KB/token means 1 GbE moves a 30K-token prompt in ~0.3 s |
+| rung | prefill side | decode side | model | status |
+|---|---|---|---|---|
+| **A · exact replica** | 2× DGX Spark, TP2 over their direct 200G cable | Mac Studio M3 Ultra 256 GB | DeepSeek-V4-Flash (284B / 13B active) | **measured** — everything in RESULTS.md |
+| **B · one Spark + any Apple Silicon Mac** | 1× DGX Spark (128 GB) | Mac Studio / Mac mini / **iMac** with ≥32 GB unified memory | a model that fits *both* boxes: the FP8 V4-Flash does **not** fit one Spark, so pick an MLA-latent model that does — DeepSeek-V2-Lite (16B) is the obvious first | recipe only, **unmeasured** |
+| **C · the kid's stack** | one used CUDA gaming card (8–24 GB) in a beat PC, vLLM or sglang | an M-series iMac / MacBook with 16 GB | the smallest MLA-latent model that fits both | recipe only, **unmeasured** |
 
-What changes at small scale is honest and worth saying: the win is the *ratio* of prefill speeds. A used
-3090 prefills a 16B MLA model far faster than a 16 GB Mac does, so the shape of the result holds; the
-absolute numbers will be smaller because the prompts and models are smaller. The porting guide's two-question
-feasibility test (`docs/PORTING.md`) tells you in ten minutes whether your pair qualifies. **We have not run
-the cheap pair ourselves.** It is the first port we want to see, and a negative result is a result — open an
-issue either way.
+What is identical across all three rungs: the front door, the verdict header, the cold/warm decision, the
+block writer path, the benchmark protocol, the wire (ordinary Ethernet — ~10 KB/token means even 1 GbE
+moves a 30K-token prompt in ~0.3 s). What changes when you move down: the model, and therefore the pooling
+math in the capture hook (DeepSeek-V4-Flash's hook is specific to its sparse attention; a plain-MLA model
+like V2-Lite is *simpler* — its per-layer cache is the K/V rows themselves). `docs/PORTING.md` names the
+four seams you touch and has a two-question feasibility test that takes ten minutes.
+
+What to expect at the bottom rung, honestly: the win is the ratio of prefill speeds. A used 3090 prefills a
+16B MLA model far faster than a 16 GB Mac does, so the shape of the result should hold; the absolute
+numbers will be smaller because the prompts and models are smaller. **We have not run rungs B or C
+ourselves.** They are the first ports we want to see, a negative result is a result, and we will feature
+whoever lands one. Open an issue.
 
 The point of this repo is that the privilege travels down. Take it apart.
 
