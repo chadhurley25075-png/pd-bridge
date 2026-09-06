@@ -1,0 +1,46 @@
+--- paged_ssd_cache.py.bak-pre-pdfallback-20260906	2026-09-05 23:56:18
++++ paged_ssd_cache.py	2026-09-05 23:56:18
+@@ -4105,7 +4105,33 @@
+         Returns:
+             PagedSSDBlockMetadata if found, None otherwise.
+         """
+-        return self._index.get(block_hash)
++        found = self._index.get(block_hash)
++        if found is None:
++            found = self._pd_index_from_disk(block_hash)
++        return found
++
++    def _pd_index_from_disk(self, block_hash: bytes):
++        """Compass 2026-09-06 (heterogeneous P/D): the startup scan is the only
++        indexer upstream, so blocks written by an external producer (the Spark
++        prefill bridge) were invisible until restart. On an index miss, look for
++        the file on disk, validate it with the same reader + compatibility check
++        the scan uses, and index it. Cheap (one stat) on a true miss."""
++        try:
++            if self._cache_dir is None or not isinstance(block_hash, (bytes, bytearray)):
++                return None
++            hex_hash = bytes(block_hash).hex()
++            file_path = self._cache_dir / hex_hash[0] / f"{hex_hash}.safetensors"
++            if not file_path.is_file():
++                return None
++            metadata = self._read_file_metadata(file_path)
++            if metadata is None or not self._is_compatible_block(metadata):
++                return None
++            self._index.add(metadata)
++            logger.info(f"[pd] indexed externally written block {hex_hash[:16]}… from disk")
++            return metadata
++        except Exception as e:  # never let the fallback break a lookup
++            logger.warning(f"[pd] disk fallback failed for block: {e}")
++            return None
+ 
+     def has_block(self, block_hash: bytes) -> bool:
+         """
+@@ -4127,7 +4153,7 @@
+         with self._pending_write_hashes_lock:
+             if block_hash in self._pending_write_buffers:
+                 return True
+-        return False
++        return self._pd_index_from_disk(block_hash) is not None
+ 
+     def preload_matched_blocks(self, block_hashes: list[bytes]) -> int:
+         """

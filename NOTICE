@@ -1,0 +1,13 @@
+pd-bridge (heterogeneous prefill/decode cache bridging)
+Copyright 2026 Chad Hurley. Apache-2.0 (see LICENSE).
+
+This project includes:
+- A patch to oMLX 0.6.4 (studio/omlx-0.6.4-paged_ssd_cache-disk-index-fallback.patch),
+  (c) its authors, used under oMLX's license. The patch adds an on-disk index fallback to
+  PagedSSDCacheIndex so externally written blocks are seen at request time; it does not
+  modify cache contents.
+- No model weights are distributed. spark/dv4_proj_weights.safetensors is DERIVED from the
+  DeepSeek-V4-Flash checkpoint and MUST be regenerated locally with `make weights` from your
+  own copy of the model, under that model's license. Do not commit or redistribute it.
+- Benchmarks use documents synthesized deterministically from the Python standard library
+  (public, PSF-licensed sources) by bench/bench_cold.py. No proprietary text is shipped.
