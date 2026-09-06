@@ -8,38 +8,65 @@ Inputs are `bench/bench_cold.py`: a deterministic synthetic document built from 
 sources with a seeded shuffle, an embedded marker, and one question. **Each seed is a genuinely cold
 prompt** — no cache clearing, no force switches, nothing either engine has seen.
 
-## Headline — 81K tokens
+## The matrix — current code, one sitting (bench6, 2026-09-06 13:31–13:43)
 
-| configuration | prompt | time to answer | decode | marker |
-|---|---|---|---|---|
-| native cold (decoder alone) | 80,768 tok | **195.1 s** | 23.7 tok/s | found |
-| **bridged cold** | 81,024 tok | **63.6 s** | 23.5 tok/s | found |
+Hook v4 (explicit flush signal + 15 s idle backstop), validating front door, streaming block writer.
+Every row below carries the front door's own `X-PD-Bridge` verdict; a native fallback cannot appear here
+as a bridged number. The decoder was otherwise idle (the prefix-cache warmer that shares it was paused).
 
-**3.07× faster to an answer.** Decode rate is unchanged, as designed — the bridge hands off before
-the first token and never participates in generation.
+| prompt | native cold (decoder alone) | **bridged cold** | gain | verdict | marker |
+|---|---|---|---|---|---|
+| ~25K tok (24,924) | 42.6 s | **28.2 s** | 1.51× | complete, 12 blocks | found / found |
+| ~82K tok (82,505) | 205.8 s | **72.9 s** | 2.82× | complete, 40 blocks | found / found |
+| ~105K tok (105,401) | 245.6 s | **75.5 s** | 3.25× | complete, 51 blocks | found / found |
+| ~25K warm (bridge self-skips) | — | 4.9 s | — | skipped: 24,576 cached | found |
 
-### Where the 63.6 s goes
+Decode rate was unchanged on every pair (23.1–25.5 tok/s bridged vs 23.7–25.4 native). Native and
+bridged legs use different seeds, so token counts differ by ≤3%.
 
-| stage | time |
-|---|---|
-| prefill engine (vLLM TP2, hook on) | 41.67 s |
-| capture flush | 2.62 s |
-| pull 0.801 GB over 10GbE | 1.08 s |
-| assemble + write 39 blocks | 4.59 s |
-| **bridge total** | **49.96 s** |
-| decoder: tail prefill + 179 tokens | 13.6 s |
+### Where the bridged time goes (bench6)
 
-The prefill engine is 65% of wall time. Transport is 1.7%.
-
-## 19K tokens
-
-| configuration | prompt | time to answer | decode |
+| stage | 25K | 82K | 105K |
 |---|---|---|---|
-| native cold | 19,493 tok | 44.7 s | 25.6 tok/s |
-| **bridged cold** | 18,553 tok | **25.5 s** | 25.4 tok/s |
-| bridged, warm (bridge self-skips) | 19,702 tok | 10.5 s | 25.2 tok/s |
+| prefill engine (vLLM TP2, hook on) | 17.1 s | 42.2 s | 53.7 s |
+| capture flush landed (DONE seen) | +0.6 s | **+15.5 s** | +1.4 s |
+| pull over 10GbE | 0.25 GB, 0.5 s | 0.82 GB, 1.0 s | 1.04 GB, 1.2 s |
+| assemble + write blocks | 3.8 s | 7.5 s | 8.6 s |
+| **bridge total** | **22.0 s** | **66.3 s** | **65.1 s** |
+| decoder: tail prefill + first token | 6.1 s | 6.5 s | 10.4 s |
 
-**1.76×.** The bridge correctly detected the warm case in 0.02 s and let the decoder serve natively.
+**The 82K row paid 15 s it did not need.** The front signals the hook the moment the prefill engine
+returns; on the 25K and 105K rows the capture closed within ~1 s of that signal, on the 82K row the hook
+missed the signal and closed on its 15 s idle backstop instead. The same lag showed on a 14.8K eval
+prompt (+13.2 s). It is the largest remaining inefficiency in the pipeline and it is a hook-side bug, not
+a physics limit — see *Known limits* in the README. With the signal landing, 82K bridged is ~58 s (3.5×).
+
+### Prior samples, same sizes (for n)
+
+| prompt | bridged cold | note |
+|---|---|---|
+| 81,024 tok | 63.6 s | hook v3.1, 2026-09-06 morning — flush landed immediately |
+| 78,504 tok | 65.6 s | hook v3.1, second cold seed |
+| 109,085 tok | 83.5 s | first 100K+ bridge; tail salvaged (52/53 boundaries) |
+| 18,553 tok | 25.5 s | hook v3.1 |
+| 18,694 tok | 19.7 s | 2026-09-06 13:04, fixed front, decoder idle; native at this size 40–46 s |
+
+So the ~80K figure now has three cold samples (63.6 / 65.6 / 72.9 s) against natives of 195–206 s, and
+the 100K figure two (83.5 salvaged / 75.5 complete) against 246–257 s.
+
+## Judged quality — the bridged leg scores 5/5
+
+Same 14.7K-token source document, same five checkable questions (`bench/eval_questions.json`), same
+lenient exact-token scoring as the native leg (which scored 5/5).
+
+| pass | how the cache was made | score |
+|---|---|---|
+| native (decoder alone) | decoder's own prefill | **5/5** |
+| bridged, pass 1 | blocks written by the bridge earlier that day (hidden-state mode) | **5/5** |
+| bridged, pass 2 | fresh cold prompt → v3 pooled bridge, verdict `complete`, 7 blocks; Q2–Q5 served from those blocks | **5/5** |
+
+Bridged answers are not token-identical to native (FP8 prefill weights vs MXFP4 decode weights) but
+every checked fact matched. This closes the "looks right, not yet proven" caveat from the first release.
 
 ## Prefill throughput
 
@@ -74,7 +101,8 @@ the prefill node removed it. The `hidden` mode is still in `pd_front.py` for com
 | bridge-written blocks vs. oMLX's own blocks | 11/11 identical (only `created_at` differs) |
 | torch pooling port vs. MLX truth, T=23,217 | projections / window / carries bit-exact; pooled 99.95–99.96% identical, worst 1 bf16 ulp |
 | hook selftest, chunked vs. one-shot | 52/52 |
-| marker retrieval, bridged and native, both sizes | 6/6 |
+| marker retrieval, bridged and native | 6/6 (earlier) + 7/7 (bench6) |
+| judged quality eval, 5 questions, bridged leg | 5/5 on two passes (native 5/5) |
 
 ## The ceiling — found, root-caused, and cured
 
@@ -128,13 +156,13 @@ the slow runs were this bug. The 25.5 s sample was genuine.
 
 ## What these numbers do not show
 
-- **No judged quality score on the bridged leg.** The native leg scores 5/5 on the question set; the
-  bridged leg has not been run against it. Prefill uses FP8 weights and decode uses MXFP4, so bridged
-  output is not token-identical to native. Marker retrieval passing 6/6 is evidence, not proof.
+- **The quality eval is five questions on one document.** Bridged 5/5 twice is evidence the cache is
+  faithful, not a benchmark suite. Prefill uses FP8 weights and decode uses MXFP4, so bridged output is
+  not token-identical to native.
 - **Warm turns gain nothing**, by design.
 - **Single stream only** (`--max-num-seqs 1`). No concurrency numbers.
-- **n=1 at most sizes.** Only the ~80K bridged figure has been reproduced (63.6 s / 65.6 s on two
-  cold seeds). The protocol asks for 3 seeds per size; that is not done.
+- **Small n.** ~80K has three cold bridged samples, ~100K two, ~20–25K two at different token counts.
+  The protocol asks for 3 seeds per size in one sitting; bench6 is one seed per size.
 - **Three machines vs one.** Two prefill nodes plus a decoder against a decoder alone. This is a
   latency result on hardware you already own, not a throughput-per-dollar or per-watt claim.
 - **13B active of 284B.** Compute per token is modest; what makes the problem hard is the cache

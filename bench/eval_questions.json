@@ -1,0 +1,16 @@
+{
+ "questions": [
+  "What are the values of _PENDING_WRITES_TARGET_RAM_FRACTION, _PENDING_WRITES_HARD_RAM_FRACTION, _PENDING_WRITES_SOFT_FLOOR and _PENDING_WRITES_CEILING? Answer as four name=value pairs.",
+  "What are the values of _DEFAULT_BLOCK_SIZE_TOKENS and _DEFAULT_KV_BYTES_PER_TOKEN?",
+  "What is the name of the first parameter of _compute_max_pending_writes and what is its default value expression?",
+  "What string value is assigned to _PM_LAYOUT_TOKEN?",
+  "List the names of the first five module-level functions (lines starting with 'def ') in order of appearance."
+ ],
+ "gold": [
+  "0.10 / 0.30 / 32 / 256",
+  "256 and 200_000",
+  "block_size_tokens = _DEFAULT_BLOCK_SIZE_TOKENS",
+  "\"@pm\"",
+  "_normalize_kv_bytes_per_token, _compute_max_pending_writes, _storage_layer_cache_types, _canonicalize_layer_cache_types, _cache_compat_signature"
+ ]
+}

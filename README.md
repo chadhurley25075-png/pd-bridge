@@ -12,13 +12,17 @@ the decode side:
 - **Link:** ordinary 10 gigabit Ethernet. No RDMA, no Thunderbolt.
 
 ```
-81,024-token cold prompt          time to answer     decode
-  Mac Studio alone                    195.1 s        23.7 tok/s
-  Sparks prefill -> Mac decode         63.6 s        23.5 tok/s      3.07x
+cold prompt        Mac Studio alone    Sparks prefill -> Mac decode
+   ~25K tokens          42.6 s               28.2 s     1.5x
+   ~82K tokens         205.8 s               72.9 s     2.8x
+  ~105K tokens         245.6 s               75.5 s     3.3x
+decode rate unchanged (23-25 tok/s both ways); warm turns bypass the bridge (4.9 s)
 ```
 
-Reproduced on a second cold seed: 78,504 tokens, 65.6 s. **Validated envelope is roughly
-20K-82K tokens** — see *Known limits* below, which is where you should look before believing
+One sitting, current code, every row verdict-checked (bench6, 2026-09-06). Best ~80K sample to date
+is 63.6 s (3.07×); the 72.9 s row above paid a 15 s flush lag that is a known hook bug, not a limit.
+The bridged leg scores **5/5 on the judged quality eval**, same as native. **Validated envelope is
+~20K-105K tokens** — see *Known limits* below, which is where you should look before believing
 anything above.
 
 Full numbers and methodology: [RESULTS.md](RESULTS.md) · [bench/BENCHMARK-PROTOCOL.md](bench/BENCHMARK-PROTOCOL.md)
@@ -109,10 +113,16 @@ This is a **reference implementation, not a library.** It is pinned hard and it 
   filesystem-fallback patch to oMLX's `PagedSSDCacheIndex` on the MLX side (oMLX indexes SSD blocks
   at model load only, so externally written blocks are otherwise invisible). **Expect this to break
   when either project moves.**
-- **The judged quality eval is not finished.** Needle retrieval passes on every run, and the native
-  leg scores 5/5 on the question set, but the bridged leg has not been scored against it. Prefill
-  runs FP8 weights and decode runs MXFP4, so bridged output is *not* token-identical to native. Until
-  that eval lands, treat quality as "looks right, not yet proven".
+- **The judged quality eval is five questions on one document.** The bridged leg scores 5/5 on it,
+  twice (once from a fresh cold v3 bridge), same as native. Prefill runs FP8 weights and decode runs
+  MXFP4, so bridged output is *not* token-identical to native; it is factually faithful on what we
+  checked, which is a smaller claim than "equivalent".
+- **The flush signal is not reliable yet.** The front door tells the Spark hook when the prefill engine
+  has returned; in 2 of 4 bridged runs on 2026-09-06 the hook missed it and closed the capture on its
+  15 s idle backstop instead (82K: +15.5 s; 14.8K: +13.2 s). Correct, just slower. The fix is on the hook
+  side (`capture_sitecustomize_v3.py`, the `FLUSH_NOW` consumer) and is the best first contribution.
+- **The front door is single-threaded.** One request at a time; a second caller queues behind a bridge
+  in flight and `/health` goes silent while the port stays open. Busy is not down.
 - Only cold, long prompts benefit. Warm turns bypass the bridge by design and are served natively.
 
 **The transferable idea is bigger than this code:** when two engines cannot share a cache format,

@@ -1,0 +1,6 @@
+OK  [37.5s] What are the values of _PENDING_WRITES_TARGET_RAM_FRACT -> '_PENDING_WRITES_TARGET_RAM_FRACTION=0.10  \n_PENDING_WRITES_HARD_RAM_FRACTION=0.30  \n_PENDING_WRITES_SOFT_FLOOR'
+OK  [36.7s] What are the values of _DEFAULT_BLOCK_SIZE_TOKENS and _ -> '`_DEFAULT_BLOCK_SIZE_TOKENS = 256`  \n`_DEFAULT_KV_BYTES_PER_TOKEN = 200_000`'
+OK  [38.3s] What is the name of the first parameter of _compute_max -> 'The first parameter is `block_size_tokens`, with default value expression `_DEFAULT_BLOCK_SIZE_TOKENS`.'
+OK  [33.2s] What string value is assigned to _PM_LAYOUT_TOKEN? -> '"@pm"'
+OK  [43.3s] List the names of the first five module-level functions -> '1. `_normalize_kv_bytes_per_token`\n2. `_compute_max_pending_writes`\n3. `_storage_layer_cache_types`\n4. `_canon'
+NATIVE score 5/5
