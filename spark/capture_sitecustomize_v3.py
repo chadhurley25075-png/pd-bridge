@@ -360,7 +360,15 @@ class _Req:
 
 # ----------------------------------------------------------------------------- the capture
 class _Capture:
-    _FLUSH = object()
+    class _Flush:
+        """Queue sentinel: 'flush the open request' (worker runs _finish). Carries WHY so the manifest's
+        flush_reason distinguishes flush_now (front signal) from idle (backstop) — they were both 'idle'."""
+        __slots__ = ("reason", "why")
+
+        def __init__(self, reason, why=None):
+            self.reason, self.why = reason, why
+
+    _FLUSH = _Flush("idle")     # legacy sentinel (tests)
 
     def __init__(self, root=_DIR, idle_s=_IDLE_S, weights=None, start_threads=True):
         self.root = root
@@ -386,9 +394,20 @@ class _Capture:
         self.last_ev = None         # last CUDA event recorded on the compute stream (9/6 mid-flush guard)
         self.opcount = None         # sampled aten-op histogram of one worker item
         self.dead = None
-        if start_threads:
-            threading.Thread(target=self._worker, daemon=True, name="pd_capture_v3_worker").start()
-            threading.Thread(target=self._watch, daemon=True, name="pd_capture_v3_watch").start()
+        # 9/6 FLUSH-LAG FIX (docs/FINDING-flush-signal-three-watchers.md): worker + watcher start LAZILY on the first record().
+        # _cap() is ALSO constructed in processes that never capture — APIServer pid 1 and EngineCore both import
+        # the attention module -> _patch_attention -> _cap() (weight preload) -> _Capture.__init__ -> a watcher
+        # thread. Three watchers polled and unlinked the same FLUSH_NOW; only the rank-0 worker ever owns a request.
+        self._start_threads_wanted = start_threads
+        self._threads_started = False
+
+    def _start_threads(self):
+        with self.lock:
+            if self._threads_started:
+                return
+            self._threads_started = True
+        threading.Thread(target=self._worker, daemon=True, name="pd_capture_v3_worker").start()
+        threading.Thread(target=self._watch, daemon=True, name="pd_capture_v3_watch").start()
 
     # -- rank / stream / rope -----------------------------------------------------------------
     def is_rank0(self):
@@ -467,6 +486,8 @@ class _Capture:
         li = int(m.group(1))
         if torch.cuda.is_current_stream_capturing() or positions.numel() == 0:
             return
+        if self._start_threads_wanted and not self._threads_started:
+            self._start_threads()              # this process records => it is the capture owner
         t0 = time.time()
         dev = hidden_states.device
         s = self._side(dev)
@@ -565,10 +586,10 @@ class _Capture:
         while True:
             item = self.q.get()
             try:
-                if item is _Capture._FLUSH:
+                if isinstance(item, _Capture._Flush):
                     with self.lock:
                         if self.req is not None:
-                            self._finish("idle")
+                            self._finish(item.reason, item.why)
                     continue
                 li, hidden, ch, ev = item
                 self._resolve_chunk(ch, ev)
@@ -611,36 +632,86 @@ class _Capture:
         _log(f"aten-op sample (layer {li}, {hidden.shape[0]} rows): {total} ops; top {top}")
 
     def _watch(self):
+        # FLUSH_NOW (9/6, the structural fix): the ONLY party that knows the prefill is truly over is the
+        # CLIENT — its engine call returns. Idle-based flushing cannot distinguish "between chunks of a
+        # chunked prefill" (GPU genuinely idle >2 s: scheduler/IPC gaps; bench5 seed 713 flushed at
+        # T=16384/16575 one second BEFORE engine return, guards aligned and satisfied) from "request
+        # finished". So: the front door touches FLUSH_NOW in the capture root when its engine call
+        # returns; the watcher consumes it and flushes immediately. PD_CAPTURE_IDLE_S<=0 disables the
+        # idle trigger entirely (front-driven operation); >0 keeps it as a backstop for standalone use.
+        flush_now = os.path.join(self.root, "FLUSH_NOW")
         while True:
             time.sleep(0.1)
             try:
-                with self.lock:
-                    r = self.req
-                    if r is None:
-                        continue
-                    # 9/6 MID-FLUSH GUARD (FINDING-bench4-cold-fallback.md root cause A): with chunked prefill
-                    # (--max-num-batched-tokens 8192) the forward thread enqueues each chunk in a burst, then the GPU
-                    # grinds ~4 s per chunk. q.empty() + 2 s idle could fire BETWEEN chunks, flushing a request that
-                    # is still running (manifest T = 16384 of 18424 etc.). The last compute-stream event is pending
-                    # exactly while the GPU is still inside the request — so an unfinished event means: do not flush.
-                    gpu_busy = self.last_ev is not None and not self.last_ev.query()
-                    # chunk-alignment guard: a complete forward step ingests one item per layer, so r.calls is a
-                    # multiple of the layer count except MID-BURST. seed 705 (9/6): the sentinel landed inside the
-                    # final chunk's enqueue burst and split it across two captures (41 orphaned items ->
-                    # AssertionError('start_pos 106496 != processed 0'), tail boundary never built).
-                    # NOTE: r must be None-checked BEFORE any r.* access — the first cut of this guard read
-                    # r.kv unconditionally and killed the watcher thread on every post-flush tick (no idle
-                    # flushes at all; every bridge declined "no captures at all").
-                    nl = (max(r.kv) + 1) if r.kv else 0
-                    aligned = (nl == 0 or r.calls % nl == 0)
-                    fire = (self.q.empty() and not gpu_busy and aligned
-                            and time.time() - r.last_t >= self.idle_s)
+                fire, reason, why = self._flush_decision(flush_now)
                 if fire:
-                    self.q.put(_Capture._FLUSH)
-                    time.sleep(self.idle_s)  # one sentinel per idle period
+                    # THE observability line: why it flushed and exactly what it saw on that tick.
+                    _log(f"flush decision: fire=1 reason={reason} — {why}")
+                    self.q.put(_Capture._Flush(reason, why))
+                    # Was time.sleep(self.idle_s) = a 15 s blind window after every flush (a chained request
+                    # finishing inside it waited for the wake-up). _finish() nulls self.req under the lock, so a
+                    # duplicate sentinel is a harmless no-op; a short pause is all that is needed.
+                    time.sleep(min(self.idle_s, 1.0) if self.idle_s > 0 else 1.0)
             except Exception as e:
                 # the watcher must NEVER die silently: no idle flushes = no captures = every bridge declines
                 _log(f"watcher error (ignored): {e!r}")
+
+    def _flush_decision(self, flush_now):
+        """One watcher tick -> (fire, reason, why). 9/6 FLUSH-LAG FIX (docs/FINDING-flush-signal-three-watchers.md).
+        The old tick did `demanded = exists(FLUSH_NOW); unlink(FLUSH_NOW); if self.req is None: continue` —
+        i.e. it CONSUMED the signal before knowing whether it could act on it, and `demanded` lived only for
+        that tick. Two consequences, both fixed here:
+          (1) three processes ran this watcher (APIServer, EngineCore, Worker_TP0 — see __init__) and only the
+              worker ever has self.req; whichever 0.1 s poller ticked first after pd_share touched the file ate
+              it. ~2/3 of runs therefore fell through to the 15 s idle backstop (measured: 5 of 8 today).
+          (2) even in the owner, a signal seen while the last chunk was still draining (q non-empty / event
+              pending / mid-burst) was unlinked, `fire` was False, and the next tick saw no file -> idle.
+        Now: a process with no open request never touches the flag; the owner consumes it only when it fires on
+        it, or when it is provably stale (mtime < this request's first_t: left over from a request that
+        idle/new-request-flushed before its signal landed). A flag that is not yet actionable stays on disk and
+        is re-read next tick — nothing is latched, nothing is lost."""
+        try:
+            sig = os.stat(flush_now).st_mtime
+        except OSError:
+            sig = None
+        now = time.time()
+        stale = False
+        with self.lock:
+            r = self.req
+            if r is None:
+                return False, None, None       # not ours / nothing open: leave the flag for the owner
+            # 9/6 MID-FLUSH GUARD (FINDING-bench4-cold-fallback.md root cause A): with chunked prefill
+            # (--max-num-batched-tokens 8192) the forward thread enqueues each chunk in a burst, then the GPU
+            # grinds ~4 s per chunk. q.empty() + idle could fire BETWEEN chunks, flushing a request that
+            # is still running (manifest T = 16384 of 18424 etc.). The last compute-stream event is pending
+            # exactly while the GPU is still inside the request — so an unfinished event means: do not flush.
+            gpu_busy = self.last_ev is not None and not self.last_ev.query()
+            # chunk-alignment guard: a complete forward step ingests one item per layer, so r.calls is a
+            # multiple of the layer count except MID-BURST (seed 705: sentinel inside the final enqueue burst).
+            nl = (max(r.kv) + 1) if r.kv else 0
+            aligned = (nl == 0 or r.calls % nl == 0)
+            q_empty = self.q.empty()
+            settled = q_empty and not gpu_busy and aligned
+            demanded = sig is not None and sig >= r.first_t   # signal written after THIS request began
+            stale = sig is not None and not demanded
+            idle_for = now - r.last_t
+            if demanded and settled:
+                fire, reason = True, "flush_now"   # client says the prefill is over and the worker has drained
+            elif self.idle_s > 0 and settled and idle_for >= self.idle_s:
+                fire, reason = True, "idle"        # backstop (standalone use / signal never arrived)
+            else:
+                fire, reason = False, None         # idle_s<=0: only FLUSH_NOW or a new request flushes
+            why = (f"signal={'none' if sig is None else f'{now - sig:.2f}s old'}{' STALE(pre-request)' if stale else ''} "
+                   f"q_empty={q_empty} gpu_busy={gpu_busy} aligned={aligned} calls={r.calls} nl={nl} "
+                   f"idle_for={idle_for:.2f}s idle_s={self.idle_s} req={r.stamp}")
+        if stale or (fire and demanded):
+            try:
+                os.unlink(flush_now)
+            except OSError:
+                pass
+            if stale:
+                _log(f"cleared stale FLUSH_NOW — {why}")
+        return fire, reason, why
 
     def flush(self, reason="manual"):
         """Synchronous flush (tests). Waits until every queued item has been ingested."""
@@ -651,7 +722,7 @@ class _Capture:
         return None
 
     # -- writer (lock held) ------------------------------------------------------------------
-    def _finish(self, reason):
+    def _finish(self, reason, why=None):
         import torch
         from safetensors.torch import save_file
         r, self.req = self.req, None
@@ -697,7 +768,7 @@ class _Capture:
         meta = {"version": _VERSION, "T": T, "num_layers": num_layers, "ratios": ratios, "boundaries": bounds,
                 "end": T, "stamp": r.stamp, "block": _BLOCK, "window": _WIN, "layers_written": len(layers),
                 "tokens_per_layer": counts, "calls": r.calls, "capture_span_s": round(r.last_t - r.first_t, 3),
-                "write_s": round(time.time() - t0, 3), "bytes": nbytes, "flush_reason": reason,
+                "write_s": round(time.time() - t0, 3), "bytes": nbytes, "flush_reason": reason, "flush_why": why,
                 "projector": self.projector, "weights": self.weights.path, "eps": self.weights.eps,
                 "weights_model": (self.weights.meta.get("model") or self.weights.meta.get("note")),
                 "rope": self.rope_config(), "rope_source": self.rope_source, "enqueue_s_total": round(self.enqueue_s, 3),

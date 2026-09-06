@@ -53,21 +53,23 @@ verdict header, the cold/warm decision, the fallback — is reusable as-is.
 prefix cache? And is your model's per-layer cache state a pure function of tensors available at prefill
 time? Two yeses and this repo is a skeleton for you. One no and it is a different, harder project.
 
-## The known bug that is also the best first contribution
+## A bug we fixed the same day, kept here because it teaches the shape of this system
 
-The front door signals the prefill hook the moment the engine returns (`FLUSH_NOW`). On roughly half
-of our runs the hook missed it and closed the capture on its 15 s idle backstop instead — correct but
-15 s slower at 82K tokens. It lives in `spark/capture_sitecustomize_v3.py` (the `FLUSH_NOW` consumer
-in the watcher thread). Fix that and the ~80K bridged time drops from ~73 s to ~58 s on our hardware.
+The front door signals the prefill hook the moment the engine returns (`FLUSH_NOW`). For most of
+2026-09-06 the hook missed it on ~2 of 3 runs: the watcher thread ran in every process that imported
+the hook (API server, engine core, worker), and the two that never own a capture unlinked the one-shot
+file on sight. Two agents found it independently from the logs; hook v5 starts the watcher only in the
+capturing worker and never consumes a signal it cannot act on. `docs/FINDING-flush-signal-three-watchers.md`
+has the timeline; `spark/test_flush_decision.py` pins the behavior without a GPU. Lesson: a sitecustomize
+hook runs everywhere Python starts — design every side effect as if three copies of you are watching.
 
 ## What we would love to see next (in order)
 
-1. The flush-signal fix above, with a bench6-style matrix proving it.
-2. **Rung B or C from the README ladder.** One Spark + an iMac, or a used gaming GPU + an M-series
+1. **Rung B or C from the README ladder.** One Spark + an iMac, or a used gaming GPU + an M-series
    Mac, with a small MLA-latent model (DeepSeek-V2-Lite is the obvious candidate). Same recipe, your
    numbers, either way. See README → *Don't have this hardware? Start on the rung you can reach*.
-3. A second decode engine (vLLM's CPU/disk KV connector, or llama.cpp's prompt cache — the latter is
+2. A second decode engine (vLLM's CPU/disk KV connector, or llama.cpp's prompt cache — the latter is
    harder, see PORTING).
-4. Multi-stream: the front door is single-threaded today.
+3. Multi-stream: the front door is single-threaded today.
 
 Open an issue with your verdict-tagged numbers. Negative results are results.
