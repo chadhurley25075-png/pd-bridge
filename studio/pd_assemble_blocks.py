@@ -3,7 +3,7 @@
 Library: assemble_and_write(cap_dir, ids, model, model_name, cache_dir) -> (paths, info).
 CLI test: pd_assemble_blocks.py --model PATH --cap DIR --ids token_ids.json --out DIR
 
-9/6 (qwenmax seat, FINDING-bench4-cold-fallback.md): a capture's manifest can promise boundaries its
+9/6 (FINDING-bench4-cold-fallback.md): a capture's manifest can promise boundaries its
 layer files do not contain (a lost tail chunk still yields T-correct manifests — boundaries are computed
 from T, not from the data). Assemble is now SALVAGE-SAFE: boundaries are attempted in order, the first
 missing key stops the loop, and the longest contiguous good prefix is written. oMLX then prefix-hits at

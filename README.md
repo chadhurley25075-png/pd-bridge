@@ -1,6 +1,14 @@
 # pd-bridge — heterogeneous prefill/decode for DeepSeek-V4-Flash
 
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![status: reference implementation](https://img.shields.io/badge/status-reference%20implementation-orange.svg)](#status-honestly)
+[![model: DeepSeek-V4-Flash](https://img.shields.io/badge/model-DeepSeek--V4--Flash-8A2BE2.svg)](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash)
+[![prefill: vLLM / CUDA](https://img.shields.io/badge/prefill-vLLM%20%2F%20CUDA-76b900.svg)](#running-it)
+[![decode: oMLX / Metal](https://img.shields.io/badge/decode-oMLX%20%2F%20Metal-lightgrey.svg)](#running-it)
+
 **Prefill a 284B model on NVIDIA. Decode it on Apple Silicon. Over plain 10GbE.**
+
+![How the bridge works](docs/architecture.svg)
 
 Two production inference engines that share no cache format, no framework, no vendor and no
 quantization, serving one request together. DeepSeek-V4-Flash is 284B total / 13B active,
@@ -166,6 +174,16 @@ docs/     DESIGN-v3-pooled.md — the pooling math and the hook points, derived 
 
 ## Running it
 
+### Prerequisites
+
+| side | hardware | software | model |
+|---|---|---|---|
+| prefill | 2× NVIDIA DGX Spark (GB10, 128 GB each) on a 200G RoCE link (TP2) | Docker + the sparkrun vLLM image with the DeepSeek-V4 plugin (`aidendle94/sparkrun-vllm-ds4-gb10:production-ready`, vLLM 0.21.1rc1) | `deepseek-ai/DeepSeek-V4-Flash` (official FP8 checkpoint, ~149 GB) |
+| decode | 1× Mac Studio M3 Ultra, 256 GB | oMLX 0.6.4 in a venv + the one-file patch in `studio/` | an MLX MXFP4-experts / MXFP8-attention conversion of `deepseek-ai/DeepSeek-V4-Flash-0731` (~156 GB; any bit-exact conversion works — ours keeps the DSpark MTP heads) |
+| link | any Ethernet ≥10 GbE between the two | SSH key from the Mac to the prefill head; Python 3.10+ on both | — |
+
+One prefill node also works (TP1) if the FP8 checkpoint fits; the numbers in RESULTS.md are TP2.
+
 ```bash
 cp config.example.env config.env && $EDITOR config.env   # nothing has a working default
 source config.env
@@ -194,9 +212,17 @@ python3 spark/pd_share.py "$PD_CAPTURE_DIR" 8010        # pooled mode (the one t
 **3. Patch and start oMLX**, then the front door (on the Mac):
 
 ```bash
-# oMLX must index externally written blocks; see docs/ for the PagedSSDCacheIndex fallback.
-$OMLX_PYTHON studio/pd_front.py
+# oMLX must notice blocks written after model load — one small patch, applied once, in the oMLX venv:
+OMLX_PKG=$($OMLX_PYTHON -c 'import omlx,os;print(os.path.dirname(omlx.__file__))')   # .../site-packages/omlx
+patch -p0 -d "$OMLX_PKG/cache" < "$OLDPWD/studio/omlx-0.6.4-paged_ssd_cache-disk-index-fallback.patch"
+# then (re)start oMLX serving $PD_MODEL on :8011, and start the front door:
+$OMLX_PYTHON studio/pd_front.py          # listens on $PD_PORT (8012), OpenAI-compatible
+curl -s localhost:8012/health             # {"ok": true, "front": "pd", ...}
 ```
+
+Point any OpenAI-compatible client at `:8012`. Prompts under `PD_MIN_TOKENS` or with fewer than
+`PD_MIN_TAIL` uncached tokens go straight to oMLX; longer cold prompts are prefilled on the Sparks. The
+`X-PD-Bridge` response header says which happened. `make doctor` checks every link in the chain.
 
 **4. Benchmark:**
 

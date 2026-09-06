@@ -65,7 +65,7 @@ The Mac assembler builds, at each boundary b: RotatingKVCache.state = (rope(kvwi
 meta (0,128,b,128); PoolingCache.state = (None, None, pooled[:b//r][None], prev_kv_b[None,None], prev_gate_b[None,None]) (prev None for ratio 128),
 then BlockWriter.snapshot(cache, b); finalize(ids). Blocks produced from MLX-computed inputs must be byte-identical to native oMLX blocks.
 
-## DECISION 09:55 (from the grok review, adopted): project with the MAC's weights, on the Spark
+## DECISION 09:55 (from an outside review, adopted): project with the MAC's weights, on the Spark
 The pooled caches must be what the Mac would have computed. So the Spark hook keeps v2's hook point (attention_impl INPUT `hidden_states`, bf16)
 and runs the cache projections itself in torch on the GPU with a DEQUANTIZED COPY OF THE STUDIO'S MXFP4 ATTENTION-PROJECTION WEIGHTS
 (~0.8 GB bf16 — only wkv/kv_norm/compressor/indexer-compressor, not q/o), then pools with pd_pool_torch. vLLM's own kv_score / fp8 caches

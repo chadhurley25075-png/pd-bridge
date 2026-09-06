@@ -32,7 +32,7 @@ t0 = time.time(); model, tok = load(args.model); mx.eval(model.parameters()); L(
 import mlx_lm.models.deepseek_v4 as dv4mod
 Block = dv4mod.DeepseekV4Block
 
-# ---- prompt + ids (same recipe as the S1 reference bench, seed 11) ----
+# ---- prompt + ids (same recipe as the decoder reference bench, seed 11) ----
 if args.prompt_file:
     p = open(args.prompt_file).read()
 else:
