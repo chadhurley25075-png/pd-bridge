@@ -22,13 +22,16 @@ vLLM's own kv_score / fp8 caches are NOT used (DECISION 09:55). Profile / dummy 
 like the plugin does (forward_context.attn_metadata not a dict); CUDA-graph capture is skipped
 (torch.cuda.is_current_stream_capturing()); TP rank 0 only (hidden_states is replicated across TP).
 
-DATA PATH: the forward thread enqueues ONLY async GPU work on one side stream `s` (s.wait_stream(cur),
-hidden.record_stream(s); NO cur.wait_event — the compute stream never waits on us): the three
-projections in <=4096-row pieces, a pinned copy of `positions`, an event. A single worker thread
-consumes the queue in order, waits on the event (host wait on the worker thread only), and runs
-pool_layer + window/prev bookkeeping on the same side stream. On idle (PD_CAPTURE_IDLE_S, default
-2 s) or a new request at position 0 it writes PD_CAPTURE_DIR/<stamp>/layer_XX.safetensors +
-manifest.json + DONE (DONE last; manifest.json is also written at request start with "T": null).
+DATA PATH (v3.1, launch-lean): the forward thread does the MINIMUM — at layer 0 of each chunk one
+device clone of `positions` (shared by all 43 layers of that chunk), then per layer: one CUDA event
+recorded on the compute stream, hidden_states.record_stream(side), queue.put. No projections, no
+copies, no host waits, no cur.wait_event. A single worker thread consumes the queue in order and,
+on the side stream, does side.wait_event(ev) (DEVICE-side), the fused projection (one call per
+layer per chunk, no piece loop), pool_layer, and the window/prev bookkeeping. The only host sync per
+CHUNK is one event wait + one 8-byte-per-token D2H to learn the chunk's start position; the final
+flush synchronizes the side stream once. On idle (PD_CAPTURE_IDLE_S, default 2 s) or a new request
+at position 0 it writes PD_CAPTURE_DIR/<stamp>/layer_XX.safetensors + manifest.json + DONE (DONE
+last; manifest.json is also written at request start with "T": null).
 
 WEIGHTS: PD_PROJ_WEIGHTS (default /pd_v3/dv4_proj_weights.safetensors; sidecar .json with
 eps/ratios) — keys layer_{i}.wkv.weight [512,4096] · layer_{i}.kv_norm.weight [512] ·
@@ -39,7 +42,8 @@ when the attention module is imported (PD_PROJ_PRELOAD=0 disables), moved to the
 stream at the first captured chunk. Missing file => the hook logs LOUDLY and captures nothing.
 
 Env: PD_CAPTURE_DIR (arms the hook) · PD_CAPTURE_IDLE_S=2.0 · PD_CAPTURE_BLOCK=2048 ·
-     PD_CAPTURE_MIN_T=64 (discard shorter captures) · PD_CAPTURE_PIECE=4096 (projection piece rows) ·
+     PD_CAPTURE_MIN_T=64 (discard shorter captures) · PD_CAPTURE_PIECE=0 (0 = never split a chunk;
+     >0 = projection piece rows) · PD_CAPTURE_OPCOUNT=1 (sample the aten-op count of ONE worker item) ·
      PD_PROJ_WEIGHTS · PD_POOL_PATH (extra import dir for pd_pool_torch) · PD_CAPTURE_V3_NOARM=1 (import
      without installing the import hook; the selftest uses it).
 """
@@ -58,7 +62,8 @@ _DIR = os.environ.get("PD_CAPTURE_DIR")
 _IDLE_S = float(os.environ.get("PD_CAPTURE_IDLE_S", "2.0"))
 _BLOCK = int(os.environ.get("PD_CAPTURE_BLOCK", "2048"))
 _MIN_T = int(os.environ.get("PD_CAPTURE_MIN_T", "64"))
-_PIECE = int(os.environ.get("PD_CAPTURE_PIECE", "4096"))
+_PIECE = int(os.environ.get("PD_CAPTURE_PIECE", "0"))
+_OPCOUNT = os.environ.get("PD_CAPTURE_OPCOUNT", "1") != "0"
 _WEIGHTS = os.environ.get("PD_PROJ_WEIGHTS", "/pd_v3/dv4_proj_weights.safetensors")
 _PRELOAD = os.environ.get("PD_PROJ_PRELOAD", "1") != "0"
 _WIN = 128                       # DV4 sliding window (config sliding_window=128)
@@ -241,12 +246,22 @@ class _KVState:
         n = kv.shape[0]
         if start != self.next_pos:
             self.gaps.append((self.next_pos, start))
-        full = kv if self.tail is None else torch.cat([self.tail, kv], 0)
-        base = start - (0 if self.tail is None else self.tail.shape[0])
+        full = base = None   # lazily built cat(tail, kv) — only when a window straddles the chunk start
         for b in _boundaries(start, start + n):
-            lo = max(b - _WIN, base)
-            self.snaps[b] = full[lo - base:b - base].clone()
-        self.tail = full[-_WIN:].clone()
+            if b - _WIN >= start:
+                self.snaps[b] = kv[b - _WIN - start:b - start].clone()
+            else:
+                if full is None:
+                    full = kv if self.tail is None else torch.cat([self.tail, kv], 0)
+                    base = start - (0 if self.tail is None else self.tail.shape[0])
+                lo = max(b - _WIN, base)
+                self.snaps[b] = full[lo - base:b - base].clone()
+        if n >= _WIN or self.tail is None:
+            self.tail = kv[-_WIN:].clone()
+        else:
+            if full is None:
+                full = torch.cat([self.tail, kv], 0)
+            self.tail = full[-_WIN:].clone()
         self.next_pos = start + n
         self.rows += n
 
@@ -280,17 +295,27 @@ class _PoolState:
         n = x.shape[0]
         if start != self.next_pos:
             self.gaps.append((self.next_pos, start))
-        full = x if self.tail is None else torch.cat([self.tail, x], 0)
-        base = start - (0 if self.tail is None else self.tail.shape[0])
+        full = base = None   # lazily built cat(tail, x)
         if self.ratio == 4:
             for b in _boundaries(start, start + n):
-                if b - 4 >= base:
-                    self.prev[b] = full[b - 4 - base:b - base].clone()
+                if b - 4 >= start:
+                    self.prev[b] = x[b - 4 - start:b - start].clone()
+                else:
+                    if full is None:
+                        full = x if self.tail is None else torch.cat([self.tail, x], 0)
+                        base = start - (0 if self.tail is None else self.tail.shape[0])
+                    if b - 4 >= base:
+                        self.prev[b] = full[b - 4 - base:b - base].clone()
         pooled_new, self.carry = _pool().pool_layer(
             x, self.ratio, self.head_dim, self.ape, self.norm_w, self.eps, self.rope, start, self.carry)
         if pooled_new is not None and pooled_new.numel():
             self.pooled.append(pooled_new)
-        self.tail = full[-_TAIL_RAW:].clone()
+        if n >= _TAIL_RAW or self.tail is None:
+            self.tail = x[-_TAIL_RAW:].clone()
+        else:
+            if full is None:
+                full = torch.cat([self.tail, x], 0)
+            self.tail = full[-_TAIL_RAW:].clone()
         self.next_pos = start + n
         self.rows += n
 
@@ -351,8 +376,15 @@ class _Capture:
         self.errors = 0
         self.projector = None       # "pd_pool_torch.project_layer" | "hook"
         self.rope_source = None
-        self.enqueue_s = 0.0
-        self.pool_s = 0.0
+        self.enqueue_s = 0.0        # forward-thread Python time inside record()
+        self.pool_s = 0.0           # worker Python time per item (projection + pooling + bookkeeping enqueue)
+        self.project_s = 0.0
+        self.host_syncs = 0
+        self.items = 0
+        self.chunks = 0
+        self.chunk = None           # current chunk descriptor (positions clone shared by all layers)
+        self.last_ev = None         # last CUDA event recorded on the compute stream (9/6 mid-flush guard)
+        self.opcount = None         # sampled aten-op histogram of one worker item
         self.dead = None
         if start_threads:
             threading.Thread(target=self._worker, daemon=True, name="pd_capture_v3_worker").start()
@@ -415,8 +447,15 @@ class _Capture:
         return P.project_layer(hidden, W)
 
     # -- forward-thread entry point ------------------------------------------------------------
+    class _Chunk:
+        __slots__ = ("posd", "start", "n", "items")
+
+        def __init__(self, posd):
+            self.posd, self.start, self.n, self.items = posd, None, None, 0
+
     def record(self, layer_name, hidden_states, positions):
-        """Forward thread: enqueue the projections on the side stream; never a host sync."""
+        """Forward thread: the absolute minimum. One positions clone per CHUNK (at layer 0), then per
+        layer: event on the compute stream + record_stream + queue.put. No projections, no host waits."""
         import torch
         if self.dead:
             return
@@ -432,34 +471,22 @@ class _Capture:
         dev = hidden_states.device
         s = self._side(dev)
         cur = torch.cuda.current_stream(dev)
-        # positions is a view of vLLM's persistent input buffer (overwritten next step): copy it on the
-        # compute stream NOW (async 8-byte-per-token D2H, no host wait) rather than later on the side stream.
-        # 9/6 (operator): a fresh pinned host allocation per call (cudaHostAlloc) is synchronous and slow — it was ~9 s of forward-thread
-        # time at 19.8K tokens. Clone positions on the DEVICE instead (async, tiny); the worker moves it to the host after the event.
-        posh = positions.detach().clone()
-        s.wait_stream(cur)                     # side stream sees hidden_states + the positions clone complete
+        if li == 0 or self.chunk is None or self.chunk.n != positions.shape[0]:
+            # positions is a view of vLLM's persistent input buffer (overwritten next step): clone it once
+            # per chunk on the compute stream; every layer of this forward step shares the same tensor.
+            posd = positions.detach().clone()
+            posd.record_stream(s)
+            self.chunk = _Capture._Chunk(posd)
+            self.chunk.n = int(positions.shape[0])
+            self.chunks += 1
+        ch = self.chunk
+        ch.items += 1
+        ev = torch.cuda.Event()
+        ev.record(cur)                         # "hidden_states (and the positions clone) are complete"
+        self.last_ev = ev                      # 9/6: watcher consults this — see _watch
         hidden_states.record_stream(s)         # allocator must not recycle it before the side stream is done
-        ratio = self.weights.ratio(li)
-        with torch.cuda.stream(s):
-            W = self.weights.layer(li, dev)           # H2D once per layer (async from pinned)
-            h = hidden_states.detach()
-            if h.dtype != torch.bfloat16:
-                h = h.to(torch.bfloat16)
-            kv_parts, ks_parts, ix_parts = [], [], []
-            for a in range(0, h.shape[0], _PIECE):
-                kv_pre, kv_score, idx = self._project(h[a:a + _PIECE], W)
-                kv_parts.append(kv_pre)
-                if kv_score is not None:
-                    ks_parts.append(kv_score)
-                if idx is not None:
-                    ix_parts.append(idx)
-            kv_pre = torch.cat(kv_parts, 0) if len(kv_parts) > 1 else kv_parts[0]
-            kv_score = (torch.cat(ks_parts, 0) if len(ks_parts) > 1 else ks_parts[0]) if ks_parts else None
-            idx = (torch.cat(ix_parts, 0) if len(ix_parts) > 1 else ix_parts[0]) if ix_parts else None
-            ev = torch.cuda.Event()
-            ev.record(s)
+        self.q.put((li, hidden_states.detach(), ch, ev))
         self.enqueue_s += time.time() - t0
-        self.q.put((li, ratio, kv_pre, kv_score, idx, posh, ev))
 
     # -- worker ------------------------------------------------------------------------------
     def ingest(self, li, ratio, kv_pre, kv_score, idx, start):
@@ -492,6 +519,47 @@ class _Capture:
             r.calls += 1
             r.last_t = time.time()
 
+    def _process(self, li, hidden, ch, ev):
+        """Worker thread. Side stream current. Device-side wait on the compute-stream event, then the
+        fused projection (ONE call per layer per chunk) + bookkeeping — no host sync here."""
+        import torch
+        s = self.stream
+        s.wait_event(ev)
+        dev = hidden.device
+        W = self.weights.layer(li, dev)            # H2D once per layer (async from pinned)
+        h = hidden if hidden.dtype == torch.bfloat16 else hidden.to(torch.bfloat16)
+        t0 = time.time()
+        if _PIECE > 0 and h.shape[0] > _PIECE:
+            kv_parts, ks_parts, ix_parts = [], [], []
+            for a in range(0, h.shape[0], _PIECE):
+                kv_pre, kv_score, idx = self._project(h[a:a + _PIECE], W)
+                kv_parts.append(kv_pre)
+                if kv_score is not None:
+                    ks_parts.append(kv_score)
+                if idx is not None:
+                    ix_parts.append(idx)
+            kv_pre = torch.cat(kv_parts, 0)
+            kv_score = torch.cat(ks_parts, 0) if ks_parts else None
+            idx = torch.cat(ix_parts, 0) if ix_parts else None
+        else:
+            kv_pre, kv_score, idx = self._project(h, W)
+        self.project_s += time.time() - t0
+        self.ingest(li, W["ratio"], kv_pre, kv_score, idx, ch.start)
+
+    def _resolve_chunk(self, ch, ev):
+        """The one host sync per CHUNK: learn start/n from the positions clone (first item of the chunk)."""
+        if ch.start is None:
+            ev.synchronize()
+            self.host_syncs += 1
+            posh = ch.posd.to("cpu")
+            n = int(posh.numel())
+            start = int(posh[0])
+            if n and int(posh[-1]) - start + 1 != n:
+                _log(f"WARNING non-contiguous positions {start}..{int(posh[-1])} n={n}")
+            ch.start, ch.n = start, n
+            ch.posd = None
+        return ch.start
+
     def _worker(self):
         import torch
         while True:
@@ -502,16 +570,15 @@ class _Capture:
                         if self.req is not None:
                             self._finish("idle")
                     continue
-                li, ratio, kv_pre, kv_score, idx, posh, ev = item
-                ev.synchronize()   # worker thread only; needed to read positions on the host
-                posh = posh.to("cpu")
-                n = int(posh.numel())
-                start = int(posh[0])
-                if n and int(posh[-1]) - start + 1 != n:
-                    _log(f"WARNING layer {li}: non-contiguous positions {start}..{int(posh[-1])} n={n}")
+                li, hidden, ch, ev = item
+                self._resolve_chunk(ch, ev)
                 t0 = time.time()
+                self.items += 1
                 with torch.cuda.stream(self.stream):
-                    self.ingest(li, ratio, kv_pre, kv_score, idx, start)
+                    if _OPCOUNT and self.opcount is None and self.items > 43 and self.weights.ratio(li) == 4:
+                        self._process_counted(li, hidden, ch, ev)
+                    else:
+                        self._process(li, hidden, ch, ev)
                 self.pool_s += time.time() - t0
             except Exception as e:
                 self.errors += 1
@@ -519,12 +586,49 @@ class _Capture:
             finally:
                 self.q.task_done()
 
+    def _process_counted(self, li, hidden, ch, ev):
+        """Run ONE item under a TorchDispatchMode that counts aten ops = a cheap upper-bound proxy for
+        kernel launches (each aten op launches >=0 kernels). Sampled once per process (ratio-4 layer,
+        after the first chunk, so it includes projection + main pool + indexer pool + bookkeeping)."""
+        try:
+            from torch.utils._python_dispatch import TorchDispatchMode
+        except Exception:
+            self.opcount = {"error": "TorchDispatchMode unavailable"}
+            return self._process(li, hidden, ch, ev)
+        counts = {}
+
+        class _Count(TorchDispatchMode):
+            def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                name = str(func.overloadpacket if hasattr(func, "overloadpacket") else func)
+                counts[name] = counts.get(name, 0) + 1
+                return func(*args, **(kwargs or {}))
+
+        with _Count():
+            self._process(li, hidden, ch, ev)
+        total = sum(counts.values())
+        top = dict(sorted(counts.items(), key=lambda kv: -kv[1])[:12])
+        self.opcount = {"layer": li, "rows": int(hidden.shape[0]), "aten_ops_total": total, "top": top}
+        _log(f"aten-op sample (layer {li}, {hidden.shape[0]} rows): {total} ops; top {top}")
+
     def _watch(self):
         while True:
             time.sleep(0.1)
             with self.lock:
                 r = self.req
-                fire = r is not None and self.q.empty() and time.time() - r.last_t >= self.idle_s
+                # 9/6 MID-FLUSH GUARD (FINDING-bench4-cold-fallback.md root cause A): with chunked prefill
+                # (--max-num-batched-tokens 8192) the forward thread enqueues each chunk in a burst, then the GPU
+                # grinds ~4 s per chunk. q.empty() + 2 s idle could fire BETWEEN chunks, flushing a request that
+                # is still running (manifest T = 16384 of 18424 etc.). The last compute-stream event is pending
+                # exactly while the GPU is still inside the request — so an unfinished event means: do not flush.
+                gpu_busy = self.last_ev is not None and not self.last_ev.query()
+                # chunk-alignment guard: a complete forward step ingests one item per layer, so r.calls is a
+                # multiple of the layer count except MID-BURST. seed 705 (9/6): the sentinel landed inside the
+                # final chunk's enqueue burst and split it across two captures (41 orphaned items ->
+                # AssertionError('start_pos 106496 != processed 0'), tail boundary never built).
+                nl = (max(r.kv) + 1) if r.kv else 0
+                aligned = (nl == 0 or r.calls % nl == 0)
+                fire = (r is not None and self.q.empty() and not gpu_busy and aligned
+                        and time.time() - r.last_t >= self.idle_s)
             if fire:
                 self.q.put(_Capture._FLUSH)
                 time.sleep(self.idle_s)  # one sentinel per idle period
@@ -588,7 +692,11 @@ class _Capture:
                 "projector": self.projector, "weights": self.weights.path, "eps": self.weights.eps,
                 "weights_model": (self.weights.meta.get("model") or self.weights.meta.get("note")),
                 "rope": self.rope_config(), "rope_source": self.rope_source, "enqueue_s_total": round(self.enqueue_s, 3),
-                "pool_s_total": round(self.pool_s, 3), "partial_start": r.partial_start,
+                "pool_s_total": round(self.pool_s, 3), "project_s_total": round(self.project_s, 3),
+                "worker_items": self.items, "chunks": self.chunks, "host_syncs": self.host_syncs,
+                "launches_per_call": (self.opcount or {}).get("aten_ops_total"),
+                "launches_note": "sampled aten-op count of ONE ratio-4 layer-chunk (upper-bound proxy for kernel launches; not a hardware count)",
+                "aten_ops_sample": self.opcount, "piece": _PIECE, "partial_start": r.partial_start,
                 "position_gaps": gaps, "worker_errors": self.errors}
         with open(os.path.join(r.dir, "manifest.json"), "w") as f:
             json.dump(meta, f, indent=1, default=str)
@@ -596,7 +704,9 @@ class _Capture:
             f.write(reason)
         self.done_stamps.append(r.stamp)
         _log(f"finished {r.stamp}: {len(layers)} layers, T={T}, boundaries={len(bounds)}, calls={r.calls}, "
-             f"span={meta['capture_span_s']}s, write={meta['write_s']}s, {nbytes/1e6:.1f} MB ({reason})"
+             f"span={meta['capture_span_s']}s, write={meta['write_s']}s, {nbytes/1e6:.1f} MB ({reason}); "
+             f"enqueue={self.enqueue_s:.2f}s worker={self.pool_s:.2f}s (project {self.project_s:.2f}s) "
+             f"items={self.items} chunks={self.chunks} host_syncs={self.host_syncs}"
              + (f" WARNING gaps={gaps}" if gaps else "") + (f" PARTIAL start={r.partial_start}" if r.partial_start else ""))
         return r.dir
 
@@ -677,5 +787,5 @@ if _DIR and os.environ.get("PD_CAPTURE_V3_NOARM") != "1":
         _patch_attention(sys.modules[_TARGET_ATTN])
     else:
         sys.meta_path.insert(0, _PostImportFinder())
-    _log(f"v3 armed (pooled capture with Mac weights; dir={_DIR}, idle {_IDLE_S}s, block {_BLOCK}, "
-         f"weights={_WEIGHTS}, piece={_PIECE})")
+    _log(f"v3.1 armed (pooled capture with Mac weights, launch-lean; dir={_DIR}, idle {_IDLE_S}s, block {_BLOCK}, "
+         f"weights={_WEIGHTS}, piece={_PIECE or 'none'})")

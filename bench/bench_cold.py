@@ -21,7 +21,13 @@ doc=doc[:len(doc)//2]+f"\n# The secret marker is {marker}.\n"+doc[len(doc)//2:]
 msgs=[{"role":"user","content":doc+"\n\nAnswer in one line: what is the secret marker written in the middle of the document above?"}]
 body=json.dumps({"model":a.model,"messages":msgs,"max_tokens":a.max_tokens,"temperature":0,"stream":True}).encode()
 t0=time.time(); first=None; out=[]
+bridge=None
 with urllib.request.urlopen(urllib.request.Request(a.url+"/v1/chat/completions",body,{"Content-Type":"application/json"}),timeout=3600) as r:
+    # record the front door's verdict so a native fallback can NEVER enter a results table as "bridged"
+    hdr=r.headers.get("X-PD-Bridge")
+    if hdr:
+        try: bridge=json.loads(hdr)
+        except Exception: bridge=hdr[:400]
     for line in r:
         if not line.startswith(b"data: ") or line.strip()==b"data: [DONE]": continue
         try: d=json.loads(line[6:])
@@ -31,4 +37,4 @@ with urllib.request.urlopen(urllib.request.Request(a.url+"/v1/chat/completions",
             if first is None: first=time.time()-t0
             out.append(c)
 tot=time.time()-t0; ans="".join(out).strip()
-print(json.dumps({"url":a.url,"seed":a.seed,"chars":len(doc),"ttft_s":round(first or -1,2),"total_s":round(tot,2),"marker":marker,"found":marker in ans,"answer":ans[:120]}))
+print(json.dumps({"url":a.url,"seed":a.seed,"chars":len(doc),"ttft_s":round(first or -1,2),"total_s":round(tot,2),"marker":marker,"found":marker in ans,"answer":ans[:120],"bridge":bridge}))

@@ -93,6 +93,8 @@ from omlx.cache.type_registry import CacheTypeRegistry
 logger = logging.getLogger("omlx_block_writer")
 
 BLOCK_SIZE = 2048  # DeepSeek-V4 family (Scheduler._POOLING_ROTATING_BLOCK_SIZE)
+
+_KB_PER_TOKEN_EST = 10.0   # ~KB of snapshot state per token per boundary (measured ~20 MB per 2048-token boundary)
 _ROTATING_NAMES = (
     "RotatingKVCache",
     "BatchRotatingKVCache",
@@ -219,11 +221,6 @@ def _eval_leaves(extracted):
         mx.eval(leaves)
 
 
-# Rough bytes-per-token of a written block; measured at 9.9-12.2 KB/token on
-# DeepSeek-V4-Flash. Used only for the peak-memory preflight log.
-_KB_PER_TOKEN_EST = 10.0
-
-
 def snapshot_boundary_states(cache_list: list[Any], token_count: int, model_name: str = "", block_size: int = BLOCK_SIZE) -> list[dict[str, Any]]:
     """Extract + compact + materialize the cache state at a 2048 boundary,
     exactly as the scheduler's prefill-time boundary snapshot does."""
@@ -310,6 +307,7 @@ class BlockWriter:
         self.prefix = BlockAwarePrefixCache(_ModelStub(cache_list_factory), self.paged, self.ssd,
                                             gdn_ssd_split_enabled=gdn_ssd_split_enabled)
         self.snapshots: dict[int, list[dict[str, Any]]] = {}
+        self.stream_boundaries = os.environ.get("PD_STREAM_BOUNDARIES", "1") != "0"
 
     # -- capture -----------------------------------------------------------
     def snapshot(self, cache_list: list[Any], token_count: int) -> None:
@@ -320,38 +318,88 @@ class BlockWriter:
     def add_extracted_snapshot(self, token_count: int, extracted: list[dict[str, Any]]) -> None:
         self.snapshots[token_count] = extracted
 
+    # -- incremental streaming (9/6, qwenmax seat): the assemble path can store each boundary THE MOMENT it
+    # is snapshotted, so peak memory is ONE boundary snapshot (~20 MB * boundary index / N) instead of the
+    # whole N(N+1)/2 accumulation. This is what lets a 100K-token capture (51 boundaries) fit beside a
+    # 156 GB resident model. finalize() transparently handles a mix of already-stored and pending snapshots.
+    def begin_stream(self, token_ids, request_id: str = "pd-bridge") -> None:
+        self._stream_ids = list(token_ids)
+        self._stream_request_id = request_id
+        self._stream_cfg = ModelCacheConfig.from_cache_list(list(self.cache_list_factory()), model_name=self.model_name)
+        self._stored: list[int] = []
+
+    def store_boundary(self, token_count: int) -> None:
+        """Store one already-snapshotted boundary immediately and release it. Requires begin_stream()."""
+        ids = self._stream_ids
+        if not (0 < token_count <= len(ids) and token_count % self.block_size == 0):
+            raise ValueError(f"store_boundary: {token_count} not a block-aligned boundary within {len(ids)} tokens")
+        snap = self.snapshots.pop(token_count)
+        table = self.prefix.store_cache(
+            self._stream_request_id, ids[:token_count], snap,
+            model_cache_config=self._stream_cfg,
+            boundary_snapshots=None,
+            extra_keys=None, extra_key_token_start=None, extra_key_ranges=None,
+            hot_cache_write_back=True,
+        )
+        del snap
+        if table is None:
+            raise RuntimeError(f"store_cache returned None at boundary {token_count}")
+        self._stored.append(token_count)
+
     # -- write -------------------------------------------------------------
     def finalize(self, token_ids: list[int], request_id: str = "pd-bridge") -> list[Path]:
-        if not self.snapshots:
+        if not self.snapshots and not getattr(self, "_stored", None):
             raise ValueError("no boundary snapshots captured")
-        valid = sorted(tc for tc in self.snapshots if 0 < tc <= len(token_ids) and tc % self.block_size == 0)
+        stored = sorted(getattr(self, "_stored", []))
+        valid = sorted(set(stored) | {tc for tc in self.snapshots if 0 < tc <= len(token_ids) and tc % self.block_size == 0})
         if not valid:
             raise ValueError("no boundary snapshot within token_ids")
         latest = valid[-1]
         tokens = list(token_ids[:latest])
-        cache_to_store = self.snapshots[latest]
-        intermediate = {tc: self.snapshots[tc] for tc in valid if tc != latest}
         model_cache_config = ModelCacheConfig.from_cache_list(list(self.cache_list_factory()), model_name=self.model_name)
         hashes = self.chain_hashes(tokens)
         paths = [self.ssd._get_file_path(h) for h in hashes]
         self._expected_paths = paths
-        # Peak-memory preflight. Every boundary snapshot is a materialised clone of the
-        # CUMULATIVE cache, so holding N of them costs ~N*(N+1)/2 blocks worth of arrays.
-        # Log it before the store so an out-of-headroom failure is diagnosable instead of
-        # surfacing only as "block files not written" after a long stall.
+        # STREAMING STORE (9/6): batching every boundary snapshot into one store_cache made peak memory grow
+        # QUADRATICALLY with prompt length (each snapshot materialises the cumulative cache: boundary k ~ k*20 MB,
+        # so N boundaries ~ N(N+1)/2 * 20 MB — 39 boundaries ok, 47 exhausted a 256 GB Mac holding a 156 GB model).
+        # Store one boundary at a time, newest last, releasing each snapshot as we go: peak is now ONE snapshot.
+        # `stream_boundaries=False` restores the old batched behaviour for comparison.
+        # Peak-memory preflight (diagnosability): with the batched path every snapshot is held at once
+        # (~N*(N+1)/2 blocks worth); with the streaming path only what is still pending. Log before storing
+        # so an out-of-headroom failure is diagnosable instead of surfacing as "block files not written".
         _n = len(valid)
         _est_gb = (_n * (_n + 1) / 2) * self.block_size * _KB_PER_TOKEN_EST / 1e6
-        logger.info("finalize: %d boundaries, %d tokens, ~%.1f GB of snapshots held",
-                    _n, latest, _est_gb)
-        table = self.prefix.store_cache(
-            request_id, tokens, cache_to_store,
-            model_cache_config=model_cache_config,
-            boundary_snapshots=intermediate,
-            extra_keys=None, extra_key_token_start=None, extra_key_ranges=None,
-            hot_cache_write_back=True,
-        )
-        if table is None:
-            raise RuntimeError("store_cache returned None")
+        logger.info("finalize: %d boundaries (%d already streamed), %d tokens, batched-path peak ~%.1f GB",
+                    _n, len(getattr(self, "_stored", [])), latest, _est_gb)
+        table = None
+        if self.stream_boundaries:
+            for tc in valid:
+                if tc not in self.snapshots:
+                    continue  # already stored incrementally via store_boundary()
+                snap = self.snapshots.pop(tc)
+                table = self.prefix.store_cache(
+                    request_id, list(token_ids[:tc]), snap,
+                    model_cache_config=model_cache_config,
+                    boundary_snapshots=None,
+                    extra_keys=None, extra_key_token_start=None, extra_key_ranges=None,
+                    hot_cache_write_back=True,
+                )
+                del snap
+                if table is None:
+                    raise RuntimeError(f"store_cache returned None at boundary {tc}")
+        else:
+            cache_to_store = self.snapshots[latest]
+            intermediate = {tc: self.snapshots[tc] for tc in valid if tc != latest}
+            table = self.prefix.store_cache(
+                request_id, tokens, cache_to_store,
+                model_cache_config=model_cache_config,
+                boundary_snapshots=intermediate,
+                extra_keys=None, extra_key_token_start=None, extra_key_ranges=None,
+                hot_cache_write_back=True,
+            )
+            if table is None:
+                raise RuntimeError("store_cache returned None")
         self._drain()
         missing = [p for p in paths if not p.exists()]
         if missing:
@@ -368,36 +416,26 @@ class BlockWriter:
             parent = h
         return out
 
-    def _drain(self, timeout: float | None = None, stall_s: float | None = None) -> None:
+    def _drain(self, timeout: float = 45.0) -> None:
         """Wait until the background writer has committed every expected file.
 
         Watches the files themselves (exists + size stable across two polls)
         rather than the manager's pending-write bookkeeping, which can keep an
         entry after the rename and stall a naive wait forever."""
-        import os as _os
-        if timeout is None:
-            timeout = float(_os.environ.get("PD_DRAIN_TIMEOUT", "180"))
-        if stall_s is None:
-            stall_s = float(_os.environ.get("PD_DRAIN_STALL_S", "30"))
         expected = getattr(self, "_expected_paths", None) or []
         t0 = time.time()
         last_sizes: dict[Path, int] = {}
-        last_progress = t0
-        best_done = -1
+        stall_t0 = time.time()
+        n_done = -1
         while time.time() - t0 < timeout:
             sizes = {p: (p.stat().st_size if p.exists() else -1) for p in expected}
             if expected and all(s > 0 for s in sizes.values()) and sizes == last_sizes:
                 break
             done = sum(1 for s in sizes.values() if s > 0)
-            if done > best_done:
-                best_done, last_progress = done, time.time()
-            elif time.time() - last_progress > stall_s:
-                # No new file has landed for stall_s. The writer is not going to
-                # finish; give up now so the caller can fall back in seconds
-                # instead of burning the whole timeout. This is the difference
-                # between a 30-second failure and an 11-minute one.
-                logger.warning("drain stalled: %d/%d blocks after %.0fs, giving up",
-                               done, len(expected), time.time() - t0)
+            if done != n_done:
+                n_done, stall_t0 = done, time.time()
+            elif time.time() - stall_t0 > 30.0:
+                logger.warning("drain stalled: %d/%d blocks after 30s with no progress", done, len(expected))
                 break
             last_sizes = sizes
             time.sleep(0.2)

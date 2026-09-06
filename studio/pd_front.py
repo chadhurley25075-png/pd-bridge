@@ -36,6 +36,13 @@ PD_MIN_TAIL=int(os.environ.get("PD_MIN_TAIL","8192"))   # pooled mode: bridge wh
 PD_MAX_BRIDGE_TOKENS=int(os.environ.get("PD_MAX_BRIDGE_TOKENS","81920"))  # 40 boundaries
 PD_MODE=os.environ.get("PD_MODE","hidden")   # "hidden" = v2 hidden-state capture+rebuild, "pooled" = v3 pooled capture+assemble
 PD_PULL_DIR=os.path.expanduser(os.environ.get("PD_PULL_DIR","~/pd_pull"))
+# Capture-trust knobs (see docs/FINDING-bench4-cold-fallback.md): the hook can flush MID-REQUEST during
+# chunked prefill (DONE + manifest T < request T) and a T-correct capture can still miss tail-boundary
+# data. The front validates every DONE capture, prefers a complete one, salvages the best contiguous
+# prefix, or declines LOUDLY — a native fallback can never masquerade as a bridged measurement.
+PD_CAPTURE_GRACE=float(os.environ.get("PD_CAPTURE_GRACE","45"))    # after engine returns: wait this long for the final capture flush
+PD_STAMP_TIMEOUT=float(os.environ.get("PD_STAMP_TIMEOUT","300"))   # no capture stamp at all by here (engine still running) = share/hook dead
+PD_MIN_COVERAGE=float(os.environ.get("PD_MIN_COVERAGE","0.5"))     # salvage floor: contiguous captured prefix / request tokens
 import shutil
 PD_PORT=int(os.environ.get("PD_PORT","8012"))
 LOCAL_CAP=os.path.expanduser("~/pd_capture_in"); os.makedirs(LOCAL_CAP,exist_ok=True)
@@ -244,9 +251,25 @@ def spark_prefill_pipelined(ids, chunk=2048):
     tm.update({"t_engine":round(eng.get("t",-1),2),"t_first_bytes":round(t_first or -1,2),"t_rebuild_done":round(time.time()-tm["t0"],2),"pulled_gb":round(pulled_bytes/1e9,2)})
     return cache, w, tm
 
+def _cap_manifest(base, stamp):
+    with urllib.request.urlopen(f"{base}/{stamp}/manifest.json", timeout=30) as r:
+        return json.loads(r.read())
+
+def _cap_usable_prefix(man):
+    """Tokens of contiguous-from-0 capture data this manifest promises. 0 = untrustworthy (a mid-request
+    flush fragment or a capture with position gaps can't seed blocks from token 0)."""
+    if man.get("partial_start"): return 0
+    if man.get("position_gaps"): return 0
+    return int(man.get("T") or 0)
+
 def spark_prefill_pooled(ids):
-    """v3: run the Spark prefill; the hook writes a ~1 GB pooled capture (see DESIGN-v3-pooled.md); pull it whole once DONE
-    appears, assemble cache states directly and write blocks. Returns (writer_paths, timings)."""
+    """v3: run the Spark prefill; the hook writes a pooled capture (see DESIGN-v3-pooled.md).
+    Scan every new DONE stamp, validate its manifest against the request, and use the FIRST COMPLETE
+    capture (manifest T == request T, no partial_start, no position_gaps). If the engine finishes and no
+    complete capture exists after PD_CAPTURE_GRACE, salvage the best contiguous-prefix candidate (the
+    assemble step verifies keys per boundary and writes the longest good prefix, so a capture that lost
+    its tail chunk still yields a prefix hit) or decline loudly. Returns (writer_paths, timings); raises
+    on decline — the caller falls back to native and X-PD-Bridge carries the reason."""
     from pd_assemble_blocks import assemble_and_write
     base=PD_SPARK.rsplit(":",1)[0]+":8010"; T=len(ids)
     before={e["name"] for e in _ls(base) if e["dir"]}
@@ -257,18 +280,43 @@ def spark_prefill_pooled(ids):
             r=urllib.request.urlopen(urllib.request.Request(PD_SPARK+"/v1/completions",body,{"Content-Type":"application/json"}),timeout=900); r.read(); eng["t"]=time.time()-tm["t0"]
         except Exception as e: eng["err"]=repr(e)
     th=threading.Thread(target=_engine,daemon=True); th.start()
-    stamp=None
-    while stamp is None:
-        if "err" in eng: raise RuntimeError("spark engine: "+eng["err"])
-        new=[e["name"] for e in _ls(base) if e["dir"] and e["name"] not in before]
-        if new: stamp=sorted(new)[-1]; tm["stamp_seen"]=round(time.time()-tm["t0"],2)
-        else: time.sleep(0.1)
+    scanned={}; chosen=None; t_eng_done=None
     while True:
-        names={e["name"] for e in _ls(base, stamp)}
-        if "DONE" in names: break
+        try: dirs=sorted(e["name"] for e in _ls(base) if e["dir"] and e["name"] not in before)
+        except Exception as e: dirs=[]; L(f"bridge: capture share unreachable ({e!r}) — retrying")
+        if dirs and "stamp_seen" not in tm: tm["stamp_seen"]=round(time.time()-tm["t0"],2)
+        for stamp in dirs:
+            if stamp in scanned: continue
+            try:
+                names={e["name"] for e in _ls(base, stamp)}
+                if "DONE" not in names or "manifest.json" not in names: continue
+                man=_cap_manifest(base, stamp)
+            except Exception: continue
+            up=_cap_usable_prefix(man)
+            scanned[stamp]=(up,man)
+            L(f"bridge: capture {stamp}: manifest T={man.get('T')} usable_prefix={up} flush={man.get('flush_reason')} calls={man.get('calls')} bytes={man.get('bytes')} gaps={bool(man.get('position_gaps'))} partial_start={man.get('partial_start')}")
+            if man.get("T")==T and up==T:
+                chosen=stamp; break
+        if chosen:
+            tm["t_done_seen"]=round(time.time()-tm["t0"],2); break
         if "err" in eng: raise RuntimeError("spark engine: "+eng["err"])
-        time.sleep(0.1)
-    tm["t_done_seen"]=round(time.time()-tm["t0"],2)
+        if eng.get("t") is not None:
+            if t_eng_done is None:
+                t_eng_done=time.time(); tm["t_engine"]=round(eng["t"],2)
+                L(f"bridge: engine done +{eng['t']:.1f}s; waiting up to {PD_CAPTURE_GRACE:.0f}s for the final capture flush")
+            elif time.time()-t_eng_done>PD_CAPTURE_GRACE: break
+        elif time.time()-tm["t0"]>PD_STAMP_TIMEOUT:
+            raise RuntimeError(f"no complete capture {PD_STAMP_TIMEOUT:.0f}s after request start while the engine still runs — capture share down or hook dead?")
+        time.sleep(0.2)
+    verdict="complete"; stamp=chosen
+    if stamp is None:
+        cands=sorted(((up,s) for s,(up,man) in scanned.items() if up>0))
+        best_up,best_s=(cands[-1] if cands else (0,None))
+        if best_s is None or best_up < PD_MIN_COVERAGE*T:
+            detail="; ".join(f"{s}: T={man.get('T')} up={up} flush={man.get('flush_reason')}" for s,(up,man) in sorted(scanned.items())) or "no captures at all"
+            raise RuntimeError(f"bridge declined: no usable capture for T={T} after engine completion + {PD_CAPTURE_GRACE:.0f}s grace. Candidates — {detail}. Likely the hook's mid-request idle flush during chunked prefill (FINDING-bench4-cold-fallback.md root cause A).")
+        stamp=best_s; verdict=f"salvage {best_up}/{T}"
+        L(f"bridge: no complete capture; salvaging {stamp} (usable prefix {best_up}/{T} = {best_up/T:.0%})")
     local=os.path.join(PD_PULL_DIR, stamp); os.makedirs(local, exist_ok=True); pulled=0
     for e in _ls(base, stamp):
         if e["dir"] or e["name"]=="DONE": continue
@@ -278,9 +326,17 @@ def spark_prefill_pooled(ids):
                 if not b: break
                 f.write(b); pulled+=len(b)
     tm["t_pulled"]=round(time.time()-tm["t0"],2); tm["pulled_gb"]=round(pulled/1e9,3)
-    paths=assemble_and_write(local, ids, MODEL, PD_MODEL_NAME, PD_CACHE_DIR)
-    th.join(timeout=600)
-    tm.update({"t_engine":round(eng.get("t",-1),2),"t_assembled":round(time.time()-tm["t0"],2)})
+    paths,ainfo=assemble_and_write(local, ids, MODEL, PD_MODEL_NAME, PD_CACHE_DIR)
+    th.join(timeout=60)
+    tm.update({"t_engine":round(eng.get("t",-1),2),"t_assembled":round(time.time()-tm["t0"],2),
+               "boundaries_ok":ainfo["boundaries_ok"],"B":ainfo["B"],"coverage":ainfo["coverage"]})
+    if "missing_at" in ainfo: tm["missing_at"]=ainfo["missing_at"]
+    cov=ainfo["coverage"]
+    if not paths or cov<PD_MIN_COVERAGE:
+        raise RuntimeError(f"bridge declined: assembled {ainfo['B']}/{T} tokens ({cov:.0%}) < {PD_MIN_COVERAGE:.0%} minimum — capture incomplete (missing_at={ainfo.get('missing_at')})")
+    full_B=(T//2048)*2048          # B<full_B means genuinely missing boundaries; B==full_B with a sub-boundary tail is the NORMAL complete case (oMLX prefills the tail natively by design)
+    if ainfo["B"]<full_B: verdict=f"partial {ainfo['B']}/{T}"
+    tm["verdict"]=verdict
     try: shutil.rmtree(local)
     except Exception: pass
     return paths, tm
