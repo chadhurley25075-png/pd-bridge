@@ -175,6 +175,10 @@ bench/    bench_cold.py (records the X-PD-Bridge verdict), hetero (the one-comma
           BENCHMARK-PROTOCOL.md
 docs/     DESIGN-v3-pooled.md — the pooling math and the hook points, derived from oMLX's own code
           FINDING-bench4-cold-fallback.md — the mid-request-flush autopsy; what broke and what it taught
+          FINDING-flush-signal-three-watchers.md — why the flush signal was consumed by the wrong worker
+          FINDING-stale-limits-after-a-window-change.md — READ THIS BEFORE RAISING YOUR WINDOW.
+              Five numbers sized against the old window that break silently after you raise it,
+              including the one that clamps every long-context answer to a single token.
 ```
 
 ## Don't have this hardware? Start on the rung you can reach
