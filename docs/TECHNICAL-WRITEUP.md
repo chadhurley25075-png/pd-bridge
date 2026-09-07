@@ -171,16 +171,36 @@ in 0.02 s, skips itself, decoder serves natively in 10.5 s.
 
 The design is only as good as the claim that reconstructed pools *are* the decoder's pools. Tested:
 
-| check | result |
-|---|---|
-| rebuilt cache arrays vs. a full native forward | **313/313 bit-exact** |
-| bridge-written blocks vs. oMLX's own blocks for the same prompt | **11/11 identical** (only the `created_at` stamp differs) |
-| torch pooling port vs. MLX ground truth, T=23,217 | projections, pre-RoPE window, carries **bit-exact**; pooled r=4 rel 2.6e-3 (99.96% identical), r=128 rel 2.5e-4, indexer rel ≤7.4e-3 — worst case **one bf16 ulp** |
-| in-container hook selftest, chunked vs. one-shot | **52/52** |
-| marker retrieval through a fully reconstructed 81K cache | correct on every run |
+**Read the provenance column before the result column.** Three of these checks are *same-input*: both
+sides start from one set of captured attention inputs, so they test our reconstruction and writing
+math, not the end-to-end effect of prefilling in FP8 and decoding in MXFP4. That end-to-end difference
+is real, it is flagged in Limits, and as of this writing it has **only behavioural evidence** — no
+numeric one. We say which is which rather than let a strong number stand in for a claim it cannot make.
+
+| check | provenance | result |
+|---|---|---|
+| rebuilt cache arrays vs. the caches the same MLX prefill produced | same-input — both sides replay one capture, on the Mac, in MLX | **313/313 bit-exact** |
+| bridge-written blocks vs. oMLX's own blocks for the same prompt | same-input — blocks assembled from an MLX-computed capture | **11/11 identical** (only the `created_at` stamp differs) |
+| torch pooling port vs. MLX ground truth, T=23,217 | same-input, cross-framework — MLX truth exported from that capture | projections, pre-RoPE window, carries **bit-exact**; pooled r=4 rel 2.6e-3 (99.96% of elements identical), r=128 rel 2.5e-4, indexer rel ≤7.4e-3 — worst case **one bf16 ulp** |
+| in-container hook selftest, chunked vs. one-shot | same-input | **52/52** |
+| marker retrieval through a fully reconstructed 81K cache | **end-to-end** — real FP8 prefill → real MXFP4 decode | correct on every run |
+| judged answer quality, 5 questions, bridged vs. native leg | **end-to-end** | 5/5 both legs, two passes |
+| Spark FP8 attention inputs vs. Mac MXFP4 attention inputs, identical tokens | **end-to-end, numeric** | **not yet measured — open** |
 
 Compare tensors, not file hashes — `created_at` means a bridge-written block can never be
 byte-identical as a *file*.
+
+**The open row is the one worth running.** The bridge's prefill runs FP8 on CUDA; the decoder runs
+MXFP4 on Metal. Those two forwards cannot produce bit-identical hidden states — which is exactly why
+the bit-exact rows above had to be same-input to mean anything. The honest characterisation of the
+bridge is the layer-by-layer divergence between those two forwards on the same tokens, and we own
+every piece of machinery needed to measure it: capture on both sides, diff with `pd_diff_state.py`.
+Until that number exists, treat the retrieval and judged-eval rows as the only evidence that the
+quantisation gap does not matter in practice.
+
+Credit for pushing on this: a reader asked whether the 313/313 started from the same captured hidden
+states or from independent native and bridged forwards. It was the former, the distinction matters,
+and the table above now says so.
 
 ### The payload mistake, since it's the most useful thing here
 

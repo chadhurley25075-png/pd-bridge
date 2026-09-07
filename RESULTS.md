@@ -128,14 +128,24 @@ the prefill node removed it. The `hidden` mode is still in `pd_front.py` for com
 
 ## Correctness
 
-| check | result |
-|---|---|
-| rebuilt cache arrays vs. full native forward | 313/313 bit-exact |
-| bridge-written blocks vs. oMLX's own blocks | 11/11 identical (only `created_at` differs) |
-| torch pooling port vs. MLX truth, T=23,217 | projections / window / carries bit-exact; pooled 99.95–99.96% identical, worst 1 bf16 ulp |
-| hook selftest, chunked vs. one-shot | 52/52 |
-| marker retrieval, bridged and native | 6/6 (earlier) + 7/7 (bench6) |
-| judged quality eval, 5 questions, bridged leg | 5/5 on two passes (native 5/5) |
+Provenance matters more than the numbers here, so it gets its own column. *Same-input* means both
+sides start from one captured set of attention inputs — those rows test reconstruction and writing
+math. *End-to-end* means a real FP8 prefill fed a real MXFP4 decode.
+
+| check | provenance | result |
+|---|---|---|
+| rebuilt cache arrays vs. the caches the same MLX prefill produced | same-input (both sides on the Mac, in MLX) | 313/313 bit-exact |
+| bridge-written blocks vs. oMLX's own blocks | same-input (blocks from an MLX-computed capture) | 11/11 identical (only `created_at` differs) |
+| torch pooling port vs. MLX truth, T=23,217 | same-input, cross-framework | projections / window / carries bit-exact; pooled 99.95–99.96% of elements identical, worst 1 bf16 ulp |
+| hook selftest, chunked vs. one-shot | same-input | 52/52 |
+| marker retrieval, bridged and native | end-to-end | 6/6 (earlier) + 7/7 (bench6) |
+| judged quality eval, 5 questions, bridged leg | end-to-end | 5/5 on two passes (native 5/5) |
+| Spark FP8 attention inputs vs. Mac MXFP4 attention inputs, same tokens | end-to-end, numeric | **not yet measured — open** |
+
+The bit-exact rows cannot speak to the FP8-vs-MXFP4 difference noted under Limits, because two
+different quantisations cannot produce bit-identical tensors — the exactness is evidence the inputs
+were shared, not that the gap is zero. That gap currently has behavioural evidence only. Measuring it
+directly is the open item.
 
 ## The ceiling — found, root-caused, and cured
 
