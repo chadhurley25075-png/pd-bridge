@@ -130,8 +130,12 @@ This is a **reference implementation, not a library.** It is pinned hard and it 
   processes and two of them deleted the signal before the capturing worker saw it (~1 in 3 hit rate). Hook v5
   fixes it; captures now close 0.6–0.9 s after the engine returns (4.8 s at 236K, which is the block write).
   Autopsy: `docs/FINDING-flush-signal-three-watchers.md`. Unit test: `spark/test_flush_decision.py`.
-- **The front door is single-threaded.** One request at a time; a second caller queues behind a bridge
-  in flight and `/health` goes silent while the port stays open. Busy is not down.
+- **The front door is threaded, with one caveat.** HTTP handlers run in threads (health, model list and
+  oMLX passthrough answer immediately, and concurrent decodes overlap because the decoder batches them),
+  but every `bridge()` call — the MLX cache assembly — is marshalled to the main thread and runs one at a
+  time, because MLX streams are thread-local and the model lives there. Measured 2026-09-06: a short
+  request completed in 47 s while an 86K-token cold bridge was in flight, instead of waiting it out.
+  Two clients do slow each other down; they no longer block each other.
 - Only cold, long prompts benefit. Warm turns bypass the bridge by design and are served natively.
 
 **The transferable idea is bigger than this code:** when two engines cannot share a cache format,

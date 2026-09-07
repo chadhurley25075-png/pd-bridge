@@ -34,8 +34,10 @@ correct first result.
 3. **Warm prompts bypass the bridge by design.** A short question, or a document the decoder has seen,
    goes straight to the decoder. To exercise the bridge you need ≥ `PD_MIN_TAIL` (default 8192)
    *uncached* tokens. `bench/bench_cold.py` builds guaranteed-cold prompts from a seed.
-4. **The front door is single-threaded.** One request at a time. `/health` goes silent while a bridge
-   is in flight but the port stays open. Busy is not down.
+4. **The front door is threaded; `bridge()` is not.** HTTP runs in handler threads; every MLX cache
+   assembly is queued to the main thread (MLX streams are thread-local, the model lives there). So
+   concurrent callers overlap on decode and serialize on cache-building. If you add work that touches
+   MLX, put it through that same queue — do not call it from a handler thread.
 5. **Run the hook-off control** (`PD_HOOK=off ./spark/pd-launch-v3.sh`) before you believe any prefill
    number. The capture hook's cost is only knowable against the engine alone.
 6. **Never commit `dv4_proj_weights.safetensors` or any model derivative.** `make weights` regenerates
@@ -70,6 +72,6 @@ hook runs everywhere Python starts — design every side effect as if three copi
    numbers, either way. See README → *Don't have this hardware? Start on the rung you can reach*.
 2. A second decode engine (vLLM's CPU/disk KV connector, or llama.cpp's prompt cache — the latter is
    harder, see PORTING).
-3. Multi-stream: the front door is single-threaded today.
+3. Further concurrency: the bridge step still serializes (one MLX cache assembly at a time).
 
 Open an issue with your verdict-tagged numbers. Negative results are results.

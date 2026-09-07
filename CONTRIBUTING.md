@@ -52,7 +52,7 @@ eval is contribution #5 in the README list and the last thing standing between "
    Apple Silicon Mac. Same recipe, your numbers. This is the port that makes the idea useful to people
    without a rack, and we will feature it here.
 2. A second decode engine (vLLM CPU/disk KV connector; llama.cpp prompt-cache — harder, see PORTING).
-3. Multi-stream front door.
+3. Further front-door concurrency (the MLX cache-assembly step still serializes).
 
 If you are an AI agent working on this: read `AGENTS.md` first. If you are a kid with an old iMac and a
 beat gaming PC: that is exactly who this is for. Say so in the issue.

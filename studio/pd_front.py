@@ -1,45 +1,36 @@
 #!/usr/bin/env python3
-"""pd_front.py — the heterogeneous P/D front door for DeepSeek-V4-Flash.
-Runs ON the decode machine next to oMLX. OpenAI-compatible /v1/chat/completions on :8012.
+"""pd_front.py — the heterogeneous P/D front door for DeepSeek-V4-Flash (2026-09-06).
+Runs ON the decode Studio next to oMLX. OpenAI-compatible /v1/chat/completions on :8012.
 Per request:  tokenize (oMLX's own patched tokenizer/template) → POST ids to the Spark prefill
 engine (vLLM TP2, capture hook) → fetch the per-layer attention-input capture (rsync over LAN) →
 rebuild oMLX caches locally with the resident attention-only model → write blocks into oMLX's
 SSD prefix cache (omlx_block_writer) → forward the ORIGINAL chat request to oMLX (:8011), which
 hits the prefix and only decodes. Falls back to plain oMLX on any bridge error (never breaks a reply).
-Env: PD_MODEL (MLX model dir), PD_MODEL_NAME (oMLX model id), PD_SPARK ($PD_SPARK),
-     PD_SPARK_SSH (user@<prefill-head>), PD_SPARK_CAPDIR (capture dir on the prefill head),
-     PD_OMLX (http://127.0.0.1:8011), PD_CACHE_DIR (~/.omlx/cache), PD_MIN_TOKENS (default 4096: below this, skip the bridge),
-     PD_MAX_BRIDGE_TOKENS (default 81920: above this, skip the bridge — see the note by its definition)
+Env: PD_MODEL (MLX model dir), PD_MODEL_NAME (oMLX model id), PD_SPARK (http://PREFILL_HOST:8000),
+     PD_SPARK_SSH (PREFILL_USER@PREFILL_HOST), PD_SPARK_CAPDIR (~/pd_capture),
+     PD_OMLX (http://127.0.0.1:8011), PD_CACHE_DIR (~/.omlx/cache), PD_MIN_TOKENS (default 4096: below this, skip the bridge)
 """
 import json, os, sys, time, glob, subprocess, threading, traceback
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
+import threading, queue as _queue
 import urllib.request
 import mlx.core as mx
 
 PD_MODEL=os.environ.get("PD_MODEL", os.path.expanduser("~/models/DV4-Flash-MXFP4-MLX"))
 PD_MODEL_NAME=os.environ.get("PD_MODEL_NAME","DV4-Flash-MXFP4-MLX")
-PD_SPARK=os.environ["PD_SPARK"]                 # required, e.g. http://10.0.0.11:8000
-PD_SPARK_SSH=os.environ["PD_SPARK_SSH"]             # required, e.g. user@10.0.0.11
-PD_SPARK_CAPDIR=os.environ["PD_SPARK_CAPDIR"]          # required: capture dir on the prefill head
+PD_SPARK=os.environ.get("PD_SPARK","http://PREFILL_HOST:8000")
+PD_SPARK_SSH=os.environ.get("PD_SPARK_SSH","PREFILL_USER@PREFILL_HOST")
+PD_SPARK_CAPDIR=os.environ.get("PD_SPARK_CAPDIR","~/pd_capture")
 PD_OMLX=os.environ.get("PD_OMLX","http://127.0.0.1:8011")
 PD_CACHE_DIR=os.environ.get("PD_CACHE_DIR",os.path.expanduser("~/.omlx/cache"))
 PD_MIN_TOKENS=int(os.environ.get("PD_MIN_TOKENS","4096"))
 PD_MIN_TAIL=int(os.environ.get("PD_MIN_TAIL","8192"))   # pooled mode: bridge when the uncached tail is at least this many tokens
-# Upper bound on what we will bridge. The block writer holds one materialised
-# cumulative cache snapshot per 2048-token boundary until finalize(), so peak
-# memory grows QUADRATICALLY with prompt length: ~sum(k)*block*KB_per_token.
-# Measured on a 256 GB M3 Ultra with a 156 GB model resident: 39 boundaries
-# (81,024 tok, ~16 GB of snapshots) succeeds; 47 boundaries (97,848 tok,
-# ~23 GB) exhausts headroom, thrashes for minutes, and writes nothing.
-# Above this ceiling we decline the bridge and let the decoder serve natively.
-# Raise it only if you have measured the headroom on YOUR machine.
-PD_MAX_BRIDGE_TOKENS=int(os.environ.get("PD_MAX_BRIDGE_TOKENS","81920"))  # 40 boundaries
 PD_MODE=os.environ.get("PD_MODE","hidden")   # "hidden" = v2 hidden-state capture+rebuild, "pooled" = v3 pooled capture+assemble
-PD_PULL_DIR=os.path.expanduser(os.environ.get("PD_PULL_DIR","~/pd_pull"))
-# Capture-trust knobs (see docs/FINDING-bench4-cold-fallback.md): the hook can flush MID-REQUEST during
+PD_PULL_DIR=os.path.expanduser(os.environ.get("PD_PULL_DIR","~/pd_lab/pd_pull"))
+# 9/6 (FINDING-bench4-cold-fallback.md): capture-trust knobs. The hook can flush MID-REQUEST during
 # chunked prefill (DONE + manifest T < request T) and a T-correct capture can still miss tail-boundary
 # data. The front validates every DONE capture, prefers a complete one, salvages the best contiguous
-# prefix, or declines LOUDLY — a native fallback can never masquerade as a bridged measurement.
+# prefix, or declines LOUDLY — a native fallback can never again masquerade as a bridged measurement.
 PD_CAPTURE_GRACE=float(os.environ.get("PD_CAPTURE_GRACE","45"))    # after engine returns: wait this long for the final capture flush
 PD_STAMP_TIMEOUT=float(os.environ.get("PD_STAMP_TIMEOUT","300"))   # no capture stamp at all by here (engine still running) = share/hook dead
 PD_MIN_COVERAGE=float(os.environ.get("PD_MIN_COVERAGE","0.5"))     # salvage floor: contiguous captured prefix / request tokens
@@ -55,7 +46,7 @@ from omlx.patches.deepseek_v4 import apply_deepseek_v4_patch; apply_deepseek_v4_
 from mlx_lm import load
 from mlx_lm.models.base import create_attention_mask
 from mlx_lm.models.cache import CacheList
-import omlx_block_writer  # the block writer: write_blocks(cache_list, token_ids, model_name, out_dir) -> paths
+import omlx_block_writer  # sister B's writer: write_blocks(cache_list, token_ids, model_name, out_dir) -> paths
 
 t0=time.time(); MODEL,TOK=load(PD_MODEL, lazy=True)
 for layer in MODEL.model.layers: mx.eval(layer.attn.parameters())
@@ -152,7 +143,7 @@ def spark_prefill(ids):
     return local, t_prefill, t_xfer
 
 def fast_update(attn, x, c):
-    """Projection-only cache update — proven bit-exact vs the full forward (on the Mac decode node, 313/313 arrays, 23,217 tok in 2.0 s)."""
+    """Projection-only cache update — proven bit-exact vs the full forward (S3, 313/313 arrays, 23,217 tok in 2.0 s)."""
     B,L,_=x.shape
     if attn.compress_ratio==0:
         local=c; offset=local.offset
@@ -303,7 +294,14 @@ def spark_prefill_pooled(ids):
         if eng.get("t") is not None:
             if t_eng_done is None:
                 t_eng_done=time.time(); tm["t_engine"]=round(eng["t"],2)
-                L(f"bridge: engine done +{eng['t']:.1f}s; waiting up to {PD_CAPTURE_GRACE:.0f}s for the final capture flush")
+                L(f"bridge: engine done +{eng['t']:.1f}s; signaling FLUSH_NOW; waiting up to {PD_CAPTURE_GRACE:.0f}s for the final capture flush")
+                # STRUCTURAL FIX (9/6, bench5 seed 713): the hook's idle watcher cannot distinguish an
+                # inter-chunk scheduler gap (GPU idle >2s, guards aligned and satisfied) from request
+                # completion — only WE know the prefill is over, because our engine call returned. Say so.
+                try:
+                    urllib.request.urlopen(base+"/_flush", timeout=5).read(); tm["t_flush_signal"]=round(time.time()-tm["t0"],2)
+                except Exception as e:
+                    L(f"bridge: /_flush signal failed ({e!r}) — hook idle/new-request backstops apply")
             elif time.time()-t_eng_done>PD_CAPTURE_GRACE: break
         elif time.time()-tm["t0"]>PD_STAMP_TIMEOUT:
             raise RuntimeError(f"no complete capture {PD_STAMP_TIMEOUT:.0f}s after request start while the engine still runs — capture share down or hook dead?")
@@ -315,7 +313,7 @@ def spark_prefill_pooled(ids):
         if best_s is None or best_up < PD_MIN_COVERAGE*T:
             detail="; ".join(f"{s}: T={man.get('T')} up={up} flush={man.get('flush_reason')}" for s,(up,man) in sorted(scanned.items())) or "no captures at all"
             raise RuntimeError(f"bridge declined: no usable capture for T={T} after engine completion + {PD_CAPTURE_GRACE:.0f}s grace. Candidates — {detail}. Likely the hook's mid-request idle flush during chunked prefill (FINDING-bench4-cold-fallback.md root cause A).")
-        stamp=best_s; verdict=f"salvage {best_up}/{T}"
+        stamp=best_s; verdict=f"salvage {best_up}/{T}"; tm["t_done_seen"]=round(time.time()-tm["t0"],2)
         L(f"bridge: no complete capture; salvaging {stamp} (usable prefix {best_up}/{T} = {best_up/T:.0%})")
     local=os.path.join(PD_PULL_DIR, stamp); os.makedirs(local, exist_ok=True); pulled=0
     for e in _ls(base, stamp):
@@ -347,9 +345,6 @@ def bridge(raw_json):
         t=time.time(); ids,_m=render_request(raw_json); t_tok=time.time()-t
         cached=cached_prefix_tokens(ids); L(f"bridge: {len(ids)} tokens (render {t_tok:.2f}s), cached prefix {cached}")
         if len(ids)<PD_MIN_TOKENS: return {"skipped":True,"tokens":len(ids),"why":"short"}
-        if len(ids)>PD_MAX_BRIDGE_TOKENS:
-            return {"skipped":True,"tokens":len(ids),"limit":PD_MAX_BRIDGE_TOKENS,
-                    "why":f"over ceiling — {len(ids)} > PD_MAX_BRIDGE_TOKENS {PD_MAX_BRIDGE_TOKENS}; snapshot memory grows quadratically, serving natively"}
         tail=len(ids)-cached
         if not os.environ.get("PD_IGNORE_CACHED"):
             if PD_MODE=="pooled":
@@ -358,7 +353,7 @@ def bridge(raw_json):
             elif cached>0: return {"skipped":True,"tokens":len(ids),"cached_prefix":cached,"tail":tail,"why":"warm — oMLX prefills only the tail natively (hidden-state mode bridges cold prompts only)"}
         if PD_MODE=="pooled":
             paths,tm=spark_prefill_pooled(ids)
-            L(f"bridge(pooled): engine {tm['t_engine']}s, DONE +{tm['t_done_seen']}s, pulled {tm['pulled_gb']} GB by +{tm['t_pulled']}s, blocks {len(paths)} by +{tm['t_assembled']}s")
+            L(f"bridge(pooled): engine {tm.get('t_engine')}s, DONE +{tm.get('t_done_seen')}s, pulled {tm.get('pulled_gb')} GB by +{tm.get('t_assembled')}s, blocks {len(paths)}, verdict {tm.get('verdict')}")
             return {"skipped":False,"mode":"pooled","tokens":len(ids),"t_tokenize":round(t_tok,2),**{k:v for k,v in tm.items() if k!="t0"},"blocks":len(paths)}
         cache,w,tm=spark_prefill_pipelined(ids)
         L(f"bridge: engine {tm['t_engine']}s, first bytes +{tm['t_first_bytes']}s, rebuild done +{tm['t_rebuild_done']}s, pulled {tm['pulled_gb']} GB")
@@ -380,7 +375,7 @@ class H(BaseHTTPRequestHandler):
         if self.path.startswith("/v1/chat/completions"):
             try:
                 req=json.loads(raw)
-                t=time.time(); info=bridge(req); info["t_bridge_total"]=round(time.time()-t,2); L("bridge",json.dumps(info))
+                t=time.time(); info=bridge_via_main(req); info["t_bridge_total"]=round(time.time()-t,2); L("bridge",json.dumps(info))
             except Exception as e:
                 info={"bridge_error":str(e)[:200]}; L("bridge FAILED, falling back:",traceback.format_exc()[-600:])
                 try:
@@ -404,6 +399,30 @@ class H(BaseHTTPRequestHandler):
         except Exception: pass
         L("omlx done", json.dumps({"ttfb_omlx":round(first or 0,2),"total_omlx":round(time.time()-t,2)}))
 
+# ── CONCURRENCY (9/6): threads for HTTP, ONE main thread for MLX ────────────────────────────
+# The model and its MLX streams live on the main thread and must stay there — but nothing else does.
+# So: handler threads serve /health and /v1/models instantly and stream oMLX passthroughs in parallel
+# (oMLX batches concurrent decodes itself, max_concurrent_requests=8), while every bridge() call is
+# marshalled to the main thread through this queue and executed one at a time, exactly as before.
+# Net effect: a second caller no longer waits for the first to finish decoding; only the cache-building
+# step serializes, which is the part that must.
+_BRIDGE_Q: "_queue.Queue[tuple]" = _queue.Queue()
+
+def bridge_via_main(req, timeout=3600):
+    """Called from a handler thread: run bridge(req) on the main thread, return its result or raise."""
+    done = threading.Event(); box = {}
+    _BRIDGE_Q.put((req, box, done))
+    if not done.wait(timeout): raise RuntimeError("bridge timed out waiting for the main thread")
+    if "err" in box: raise box["err"]
+    return box["out"]
+
 if __name__=="__main__":
-    L(f"pd_front listening :{PD_PORT} → oMLX {PD_OMLX}, Spark {PD_SPARK}")
-    HTTPServer(("0.0.0.0",PD_PORT),H).serve_forever()  # single-threaded on purpose: MLX streams are thread-local and the model lives on the main thread
+    L(f"pd_front listening :{PD_PORT} → oMLX {PD_OMLX}, Spark {PD_SPARK} (threaded HTTP, MLX on main thread)")
+    srv = ThreadingHTTPServer(("0.0.0.0", PD_PORT), H)
+    srv.daemon_threads = True
+    threading.Thread(target=srv.serve_forever, name="pd_front_http", daemon=True).start()
+    while True:                      # the main thread does nothing but MLX work, forever
+        req, box, done = _BRIDGE_Q.get()
+        try: box["out"] = bridge(req)
+        except Exception as e: box["err"] = e
+        finally: done.set()
