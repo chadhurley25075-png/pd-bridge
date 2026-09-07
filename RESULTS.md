@@ -126,6 +126,64 @@ An earlier design shipped raw hidden states — 36.14 GB for a 102K prompt, to p
 cache. **36× the payload the decoder actually consumes.** Moving the projection and pooling math onto
 the prefill node removed it. The `hidden` mode is still in `pd_front.py` for comparison.
 
+## Deep context — 2,097,152-token window (2026-09-07)
+
+Added after raising the window to 2,097,152 via YaRN factor 32 (set in the model config on **every**
+node — prefill and decode — see `docs/FINDING-stale-limits-after-a-window-change.md`). These are the
+largest bridged runs we have measured, roughly 4× the previous ceiling in this file.
+
+Four consecutive cold bridged runs at ~293K tokens, same day, same hardware:
+
+| | prefill (s) | tok/s | flush | pull | assemble | bridge total | blocks | coverage |
+|---|---|---|---|---|---|---|---|---|
+| 874,569 tok | 810.4 | 1,079 | 20.2 s | 8.1 s | 63.3 s | 903.3 s | 427 | 0.9999 |
+| 298,633 tok | 208.0 | 1,436 | 10.5 s | 2.8 s | **150.6 s** | 380 s | 145 | 0.994 |
+| 298,935 tok | 201.8 | 1,481 | 4.7 s | 3.2 s | 17.1 s | 227.4 s | 145 | 0.999 |
+| 293,046 tok | 196.6 | **1,490** | 5.2 s | 2.8 s | 16.6 s | 222.2 s | 143 | 0.9994 |
+
+Two things moved between rows two and three, and both are worth stealing:
+
+**Assembly fell from 150.6 s to 17.1 s** — the prefix cache had grown past its own configured cap and
+was evicting blocks while reading them. Clearing it and sizing the cap to the window fixed it. This
+is the single largest avoidable cost we found.
+
+**Prefill rose from 1,079 to 1,490 tok/s (+38%)** across a full power cycle of all three nodes. Hard
+kills of distributed CUDA/MLX processes leak device memory that only a reboot reclaims; several
+containers had been force-killed during debugging. If your throughput has drifted down over a long
+session of restarts, cycle the machines before you optimize anything.
+
+### Steady-state, once the prefix is warm
+
+The bridge correctly skips itself below the minimum-new-token floor, so conversational turns run on
+the decoder alone. Measured turn-to-turn at ~300K context, ~2,500 new tokens per turn:
+
+| | |
+|---|---|
+| bridge decision (skip) | **0.36 s** |
+| decode rate at ~98K context | 16.5 tok/s |
+| decode rate at ~293K–299K context | **13.4–13.7 tok/s** (flat across that span) |
+| turn-to-turn wall clock | **56–113 s**, driven by answer length |
+
+The decode rate is notably *stable* from 293K to 299K rather than degrading — going from 98K to 293K
+cost about 18%, and then it flattens. Capacity is not the wall at this size; the per-turn tail
+prefill on the decoder is, and that is recoverable by lowering the bridge's minimum-token floor so
+short tails also cross the bridge.
+
+### What the ceiling actually is
+
+Measured, not projected:
+
+| | |
+|---|---|
+| prefill KV pool (2× prefill node, util 0.82) | **5,187,815 tokens** |
+| max concurrency at a 2,097,152 window | 2.44× |
+| decoder resident memory | 12 GB of 256 GB |
+| prefix cache on disk | 9.5 GB used, 400 GB free |
+
+Nothing in the hardware stops a ~5M window. The practical limits are **prefill wall-clock** (~1 hour
+at 5M) and **rope-extrapolation quality**, which degrades silently and must be re-proven at every
+depth after any factor change — never assumed from a single successful answer.
+
 ## Correctness
 
 Provenance matters more than the numbers here, so it gets its own column. *Same-input* means both
