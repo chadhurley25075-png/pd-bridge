@@ -1,0 +1,9 @@
+# Two-box reproduction of the 24,576-token block-aligned run.
+# Same generator, same seed, different decode node AND different Python.
+# Node B was patched from this repo's own studio/omlx-0.6.4-*.patch immediately before these runs.
+
+# --- NODE B, COLD (bridge engaged) ---
+{"seed":721,"chars":75082,"ttft_s":56.23,"marker":"ZEBRA-0721-9199","found":true,"answer":"ZEBRA-0721-9199","bridge":{"skipped":false,"mode":"pooled","tokens":24942,"t_tokenize":0.06,"stamp_seen":0.36,"t_engine":16.77,"t_flush_signal":16.89,"t_done_seen":17.27,"t_pulled":17.74,"pulled_gb":0.255,"t_assembled":21.96,"boundaries_ok":12,"B":24576,"coverage":0.9853,"verdict":"complete","blocks":12,"t_bridge_total":22.04}}
+
+# --- NODE B, WARM (zero replay) ---
+{"seed":721,"chars":75082,"ttft_s":5.74,"marker":"ZEBRA-0721-9199","found":true,"bridge":{"skipped":true,"tokens":24942,"cached_prefix":24576,"tail":366,"why":"warm - new tail 366 < 8192, oMLX prefills it natively","t_bridge_total":0.05}}
