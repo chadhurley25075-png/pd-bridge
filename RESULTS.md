@@ -279,3 +279,24 @@ An earlier run measured 1.19× at 19K. That run put the decoder's one-time model
 bridged leg while the native leg ran warm, and its decode rate came in at 13.0 tok/s against native's
 24.7. Re-running with a warm engine on both legs produced the numbers above and closed the decode
 gap. **Do not cite the 1.19×.**
+
+## Reproducibility pack
+
+`docs/REPRODUCIBILITY-PACK.md` answers three reviewer requests with raw artifacts: the Mac-side
+weight-export manifest (with sha256), the complete runtime lock for both node types, and the raw
+cold + warm receipts behind the 24,576-token block-aligned run — including the zero-replay evidence
+(`cached_prefix: 24576` of `tokens: 24924`, so the decoder prefilled **348** tokens, not 24,924).
+
+Two corrections that came out of writing it, both of which change what a reproducer should do:
+
+- **We did not convert the decode checkpoint.** It is a published MXFP4 MLX build. There is no
+  conversion recipe of ours. The property that matters is that it *retains the DSpark MTP heads*,
+  which many conversions strip.
+- **The results box runs python 3.13.11**, and `bench_cold.py` builds its fixture from the
+  interpreter's own stdlib — so **the Python version is part of the fixture, not just the runtime.**
+
+And one operational finding worth more than either: we shipped the `paged_ssd_cache` patch while one
+of our own decode nodes was running **unpatched**. Without it the bridge writes valid blocks and the
+decoder still prefills natively, because the block stays invisible until restart — a silent ~5x
+slowdown that raises no error. Verify with
+`grep -c _pd_index_from_disk .../omlx/cache/paged_ssd_cache.py` (must be 3).
