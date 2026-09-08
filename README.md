@@ -24,17 +24,38 @@ cold prompt        Mac Studio alone    Sparks prefill -> Mac decode
    ~25K tokens          42.6 s               28.2 s     1.5x
    ~82K tokens         205.8 s               72.9 s     2.8x
   ~105K tokens         245.6 s               75.5 s     3.3x
-  ~241K tokens         732.3 s              200.3 s     3.7x   (the prefill pair's 262K window — the ceiling)
+  ~241K tokens         732.3 s              200.3 s     3.7x
 decode rate unchanged (23-25 tok/s both ways); warm turns bypass the bridge (4.9 s / 19.3 s at 241K)
 ```
 
-Every row verdict-checked, 2026-09-06. The 17K/79K/236K rows are hook v5, after the flush-signal fix landed
-the same afternoon (`docs/FINDING-flush-signal-three-watchers.md`); the 105K row predates it.
-The bridged leg scores **5/5 on the judged quality eval**, same as native. **Validated envelope is
-~20K-105K tokens** — see *Known limits* below, which is where you should look before believing
-anything above.
+Every row verdict-checked, 2026-09-06. The bridged leg scores **5/5 on the judged quality eval**,
+same as native.
+
+**Since then the served window went 262,144 -> 2,097,152 and the ceiling moved with it.**
+A **700,630-token cold prompt now bridges end to end in 11 minutes 26 seconds** — `verdict complete`,
+342 blocks, 1,117 tok/s of prefill. That is **2.9x past the largest prompt in the table above**, and
+the pair has accepted over a million.
+
+```
+cold prompt     engine   tok/s    end-to-end   blocks   verdict
+   192,099      119.2 s   1,611      143.1 s      93    complete
+   385,838      288.7 s   1,337      466.6 s     188    complete
+   677,069      596.8 s   1,134      655.9 s     330    complete
+   700,630      627.0 s   1,117      685.5 s     342    complete
+   709,055      635.4 s   1,116      694.6 s     345    partial 706,560/709,055 (99.6%)
+   988,487    1,037.8 s     952    1,142.5 s     376    partial 770,048/988,487 (78%)
+ 1,006,172    1,070.5 s     940    1,171.7 s     346    partial 708,608/1,006,172 (70%)
+```
+
+All 2026-09-08, one prefill pair, same 10GbE. `partial` is not a failure: past roughly 772K tokens the
+capture crosses the prefill box's free-memory floor and **seals a valid contiguous prefix** instead of
+dying; the decoder mounts what arrived and natively prefills the remainder. See *Known limits*.
+
+**We have not run a Mac-alone control at these sizes**, so those rows carry no ratio — they are what
+the bridge does, not a claimed speedup. The measured ratios stop at 241K and are shown above.
 
 Full numbers and methodology: [RESULTS.md](RESULTS.md) · [bench/BENCHMARK-PROTOCOL.md](bench/BENCHMARK-PROTOCOL.md)
+
 
 ---
 
@@ -81,6 +102,28 @@ a bridge-written block can never be byte-identical as a *file*.
 ---
 
 ## Known limits — read this before you run it
+
+### The memory floor, and why big prompts come back `partial` (2026-09-08)
+
+The capture lives in the prefill box's memory for the whole request and costs about **11.8 KB of
+unified memory per token** on rank 0 only (rank 1 stays flat — it does its half of the attention and
+holds no capture). A GB10 has ONE 121 GB pool shared by weights, the vLLM KV arena and everything
+else, so steady-state free memory with the model up is ~22 GB.
+
+Measured: the capture crosses a 5.0 GB free-memory floor at roughly **772,000 tokens**. Past that the
+hook **seals a valid contiguous prefix `[0,T)` and reports it** rather than dying — the decoder mounts
+what arrived and natively prefills the tail. That is the `partial` verdict in the table above. A
+700,630-token wake cleared the floor with **100 MB to spare**; a 1,006,172-token wake sealed at 70%.
+
+This replaced a real failure. Before the fix, `_finish()` copied every layer to the host **without
+freeing the layers it had already written**, so the full device capture and the growing host copies
+were alive at once. At 1,021,199 tokens it died after 11 of 43 layers and drove the box into swap
+thrash — no sshd even over a 200G fabric. It needed a physical power button. The hook now releases
+each layer as its file lands and checks `MemAvailable` every 64 layer-chunks.
+
+**If you are memory-tight, this is your limit, not the window.** The window is a config number; the
+floor is physics on your box. Measure `MemAvailable` during a long prefill before trusting either.
+
 
 **The ~82K-token ceiling was a real bug. It is fixed.** (History kept because the failure mode is
 instructive and the arithmetic still matters on smaller machines.)
@@ -285,6 +328,49 @@ python3 bench/bench_cold.py --chars 330000 --seed 302 --url http://<decoder>:801
 ```
 
 ## Gotchas that cost us hours
+
+### The bridge was fluent and WRONG above the native window for days (2026-09-08)
+
+**This is the most important thing in this file if you are raising the context window.**
+
+The capture hook builds the decoder's rope table from its own projection sidecar
+(`pd_v3/dv4_proj_weights.json`). When we grew the served window 1M -> 2M we updated the engine flags
+and the per-node model `config.json`, but not the sidecar. It kept **YaRN factor 16 /
+max_position 1,048,576** while the decoder ran **factor 32 / 2,097,152**.
+
+YaRN is numerically **identical below `original_max_position_embeddings` (65,536)** and diverges
+above it. So every test at or under ~65K passed, and everything above it was quietly corrupt —
+`verdict complete`, `position_gaps False`, manifest `T` matching the request, and the model unable to
+retrieve a midpoint needle. Measured before the fix: **MISS at 98,779 / 148,134 / 189,031 / 287,842 /
+385,838 — five for five.** After correcting the factor: **PASS at 189K, at 200K on a cold cache, and
+at 386K.**
+
+**The window lives in FOUR places. All of them must agree:**
+
+1. the launch parameters (`PD_MAX_MODEL_LEN`, `PD_ROPE_FACTOR`)
+2. each prefill node's model `config.json` `rope_scaling`
+3. **`pd_v3/dv4_proj_weights.json` `rope_scaling` + `max_position_embeddings`** — the one we missed
+4. the decoder's `config.json`
+
+**LAW: a window change is not done until a needle is retrieved THROUGH THE BRIDGE above the native
+window.** Our previously published "verified ceiling" had been measured on the *native* fallback path
+(the capture share happened to be down that day), so the bridged path's correctness at depth had
+never actually been tested.
+
+**Two traps that produce false verdicts:**
+
+- **A reused seed reintroduces the bug you just fixed.** Our first post-fix retest MISSED and meant
+  nothing: the document shared its first ~100K tokens with an earlier run, so the decoder served
+  88,064 tokens of cached blocks built under the old rope. **After any change to rope, projection
+  weights or capture format, verify with a FRESH SEED.**
+- **The decoder's block cache has no notion of rope config.** It is keyed by token prefix only.
+  Fixing the config does not repair what is already cached — move the cache aside (rename, do not
+  delete) or you will keep serving the old geometry.
+
+And one in the harness itself: `needle.py --max-tokens` defaulted to **48**. When the model spends
+that budget reasoning, `content` comes back empty and the harness scores a **MISS**. A 120K run
+"failed" at 48 and passed at 300 on the same document. Default raised to 300.
+
 
 - **Prefix caching must be OFF on the prefill engine.** With it on, vLLM skips a repeated document
   prefix, the hook sees `43 layers x 0 tokens`, and the decoder waits forever for rows that will
