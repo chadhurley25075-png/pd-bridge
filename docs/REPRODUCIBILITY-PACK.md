@@ -40,12 +40,37 @@ It writes the **dequantized bf16** attention-projection weights for **all 43 lay
 safetensors plus a JSON meta. This file is then staged on the prefill node; the Spark uses it so the
 pooled cache is arithmetically the Mac's, not an approximation of it.
 
-**Manifest (this is the file our published numbers were produced with):**
+**The decode checkpoint, pinned to an immutable revision:**
 
-| file | bytes | sha256 |
-|---|---:|---|
-| `dv4_proj_weights.safetensors` | 794,325,527 | `db8511b6ab8024637948ffc57714858a6298913f962bed911ec9f61a59a923ca` |
-| `dv4_proj_weights.json` | 18,776 | `ed92dc74b036748dce92a1e0218667a3fd91414dc79af4d86f685f01baeae140` |
+```
+repo:     Vontra/DeepSeek-V4-Flash-0731-MXFP4-MLX
+revision: ed6b5d6024e133b0073fc0dc9d3d1f0693aa3bb0
+base:     deepseek-ai/DeepSeek-V4-Flash-0731 (quantized)
+```
+
+**Manifest — and a correction: do NOT compare the whole-file hash.**
+
+A reviewer exporting fresh reported a **40-byte** difference against our file and asked whether
+that was expected header metadata. **It is, and the cause is our bug, not theirs:** our exporter
+wrote `__metadata__ = {"model": "<absolute source path>"}` into the safetensors header. That string
+is machine-specific, so two byte-identical tensor sets yield different header lengths, different
+file sizes, and different file hashes. Fixed — the exporter now writes a constant model name — but
+**every file produced before this commit carries the old machine-specific path.**
+
+Compare **tensors**, not the file:
+
+```bash
+studio/tensor_manifest.py dv4_proj_weights.safetensors
+```
+
+| | |
+|---|---|
+| tensors | **334** |
+| aggregate (sha256 over sorted name+tensor-hash) | **`6280138e551ad4a78f8ea0c7edadafb0a890637836091f0ecc9f209ef288b761`** |
+| full per-tensor manifest | `docs/dv4_proj_weights.MANIFEST.txt` |
+
+For reference only, the file as we produced it (header includes the old absolute path):
+`794,325,527` bytes, sha256 `db8511b6ab8024637948ffc57714858a6298913f962bed911ec9f61a59a923ca`.
 
 JSON meta carries the geometry the pooling math must agree on:
 `rms_norm_eps 1e-06` · `head_dim 512` · `qk_rope_head_dim` · `index_head_dim` · `hidden_size` ·
@@ -74,6 +99,16 @@ Ground truth for validating a rebuild: `studio/pd_export_pool_truth.py` (MLX tru
 written by an external producer mid-run are therefore invisible until restart. On an index miss the
 patch stats the expected path, validates the file with **the same reader and compatibility check
 the startup scan uses**, and indexes it.
+
+**⚠ CORRECTED 2026-09-08 — the first published version of this patch had a real defect.**
+An external reviewer pointed out that the fallback must verify the file's internal
+`metadata.block_hash` against the requested hash before indexing. They were right. The startup
+scan derives a block's identity from its **content**; the fallback reaches the file by **path**.
+Without an explicit check those two notions of identity can disagree, and a stale, truncated, or
+misnamed file at the expected path is indexed as the requested block and served as correct cache.
+The failure is silent — the model stays fluent and is simply wrong. The patch now refuses on
+mismatch and logs it. Falsifier: `studio/test_index_fallback_identity.py` (asserts the impostor is
+refused, the honest block is still indexed, and a true miss stays a miss).
 
 **Verify it is actually applied** — `grep -c _pd_index_from_disk .../omlx/cache/paged_ssd_cache.py`
 must return 3. We shipped this patch while one of our own decode nodes was running **unpatched**;
