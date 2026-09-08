@@ -182,6 +182,39 @@ door correctly *disqualifies itself* here (`skipped: true`) because there is not
 bridging — which is also the honest reason 4.87 s is a cache result and **not** a bridge speedup.
 We label it as such in `RESULTS.md` rather than quoting it as a 5.8× win.
 
+### Reproduced on a second decode node (2026-09-08)
+
+Same generator, same seed, **different decode node and different Python**. Node B was patched from
+this repo's own `studio/omlx-0.6.4-*.patch` immediately before the run. Raw lines:
+`bench/results/twobox_24576_2026-09-08.txt`.
+
+| | node A (python 3.13.11) | node B (python 3.12.3) |
+|---|---|---|
+| prompt tokens | 24,924 | 24,942 |
+| **B (block-aligned prefix)** | **24,576** | **24,576** |
+| blocks / boundaries ok | 12 / 12 | 12 / 12 |
+| coverage | 0.986 | 0.9853 |
+| verdict | complete | complete |
+| Spark engine | 17.1 s | 16.77 s |
+| **pulled** | **0.254 GB** | **0.255 GB** |
+| assemble on Mac | 21.91 s | 21.96 s |
+| warm re-run: cached_prefix / tokens | 24,576 / 24,924 | 24,576 / 24,942 |
+| warm re-run: tokens actually prefilled | **348** | **366** |
+
+**The bridge-side numbers are the same to within noise** — engine time, bytes on the wire, assemble
+time, block count and boundary validation all match across two machines and two interpreters.
+
+**And this is the stdlib caveat proving itself, not a discrepancy to explain away:** the prompt is
+75,082 chars / 24,942 tokens on node B versus 75,041 / 24,924 on node A, because the fixture is
+built from *the running interpreter's own stdlib*. The marker, the block alignment and the block
+count reproduce exactly; the exact byte count does not, and will not, unless you pin the
+interpreter.
+
+⚠ **Node B's cold TTFT is 56.23 s against node A's 28.17 s. That gap is NOT the bridge** — its
+`t_bridge_total` was 22.04 s, essentially identical to node A. The difference is entirely decoder-side:
+node B's engine had been restarted minutes earlier and was cold. We report it rather than dropping
+the row, because a reproducer will see the same thing on a freshly started engine.
+
 ### Independent block-level verification
 
 `studio/verify_blocks.py` compares bridge-written cache blocks against natively written ones
