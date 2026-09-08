@@ -1,5 +1,74 @@
 # Results — 2026-09-06
 
+---
+
+## Deep context — 2026-09-08 (window 262,144 -> 2,097,152)
+
+Every bridged run of the day, one prefill pair (2x GB10, vLLM TP2), one decode node
+(M3 Ultra, oMLX), plain 10GbE. `engine` is prefill on the pair; `end-to-end` includes the
+flush signal, the pull, and block assembly on the decoder. Verdicts are the front door's own.
+
+| tokens | engine | tok/s | end-to-end | pulled | blocks | verdict |
+|---:|---:|---:|---:|---:|---:|---|
+| 24,942 | 16.8 s | 1,487 | 22.0 s | 0.26 GB | 12 | complete |
+| 38,316 | 21.0 s | 1,825 | 26.2 s | 0.38 GB | 18 | complete |
+| 97,785 | 55.8 s | 1,752 | 61.5 s | 0.97 GB | 47 | complete |
+| 98,004 | 56.1 s | 1,748 | 66.1 s | 0.97 GB | 47 | complete |
+| 98,779 | 61.4 s | 1,608 | 113.8 s | 0.98 GB | 48 | complete |
+| 113,440 | 66.4 s | 1,709 | 77.2 s | 1.12 GB | 55 | complete |
+| 148,134 | 91.3 s | 1,622 | 166.9 s | 1.47 GB | 72 | complete |
+| 178,352 | 112.8 s | 1,581 | 165.8 s | 1.76 GB | 87 | complete |
+| 183,492 | 113.6 s | 1,615 | 212.3 s | 1.81 GB | 89 | complete |
+| 189,031 | 120.5 s | 1,568 | 213.4 s | 1.87 GB | 92 | complete |
+| 192,099 | 119.2 s | 1,611 | 143.1 s | 1.90 GB | 93 | complete |
+| 287,842 | 197.8 s | 1,456 | 335.9 s | 2.84 GB | 140 | complete |
+| 374,529 | 273.2 s | 1,371 | 414.8 s | 3.69 GB | 182 | complete |
+| 377,701 | 271.9 s | 1,389 | 348.3 s | 3.73 GB | 184 | complete |
+| 385,838 | 288.7 s | 1,337 | 466.6 s | 3.81 GB | 188 | complete |
+| **677,069** | 596.8 s | 1,134 | 655.9 s | 6.67 GB | 330 | **complete** |
+| **700,630** | **627.0 s** | **1,117** | **685.5 s** | 6.91 GB | 342 | **complete** |
+| 709,055 | 635.4 s | 1,116 | 694.6 s | 6.97 GB | 345 | partial 706,560 (99.6%) |
+| 988,487 | 1,037.8 s | 952 | 1,142.5 s | 7.60 GB | 376 | partial 770,048 (78%) |
+| 1,006,172 | 1,070.5 s | 940 | 1,171.7 s | 7.00 GB | 346 | partial 708,608 (70%) |
+
+**Prefill throughput degrades gracefully with depth** — ~1,750 tok/s near 100K, ~1,600 at 190K,
+~1,340 at 386K, ~1,117 at 700K, ~950 at 1M. Payload holds at roughly 10 KB/token; the pull is never
+the bottleneck (7.6 GB in 7.2 s at 988K).
+
+**`partial` is the memory floor, not a failure.** See *Known limits* in the README: the capture
+crosses the prefill box's free-memory floor near 772K tokens and seals a valid contiguous prefix.
+
+### Correctness at depth
+
+Bridged retrieval was **wrong above 65,536 tokens** until 2026-09-08 because the capture hook's
+projection sidecar carried YaRN factor 16 while the decoder ran factor 32. Needle at the midpoint:
+
+| tokens | before the fix | after |
+|---:|---|---|
+| 98,779 | MISS | — |
+| 148,134 | MISS | — |
+| 189,031 | MISS | **PASS** (315.7 s, bridged, `verdict complete`, fresh seed) |
+| ~200,000 | — | **PASS** (cold cache) |
+| 287,842 | MISS | — |
+| 385,838 | MISS | **PASS** |
+
+Every MISS reported `verdict complete` with no position gaps. See *Gotchas* in the README —
+this is the failure mode to design against when you raise a window.
+
+**Not yet verified through the bridge:** retrieval above 386K. A midpoint needle was retrieved at
+1,016,982 tokens, but on the **native** path, not through the bridge. We do not claim it bridged.
+
+### Two rows worth reading together
+
+`703,997` at 14:00 came back **partial 489,472 (70%)**. `700,630` at 14:53 — 53 minutes later, same
+pair, essentially the same prompt size — came back **complete, and 250 s faster end to end**. The
+only change was killing a background job that had been firing ~100K-token prefills into the same
+pair every 15 minutes. It was stealing the unified memory the capture needed, so the floor arrived
+earlier in the token stream.
+
+**Measure nothing on shared hardware without first proving it is yours.**
+
+
 All figures measured on the hardware described in [bench/BENCHMARK-PROTOCOL.md](bench/BENCHMARK-PROTOCOL.md).
 Nothing here is derived or extrapolated. Every bridged run has a native cold run on the same box, same
 prompt shape, same engine state.
