@@ -48,7 +48,7 @@ for i, layer in enumerate(model.model.layers):
         lm["idx_out_dim"] = c.out_dim; lm["idx_head_dim"] = c.head_dim
     meta["layers"][str(i)] = lm
 mx.eval(*out.values())
-p = os.path.join(args.out, "dv4_proj_weights.safetensors"); mx.save_safetensors(p, out, metadata={"model": args.model})
+p = os.path.join(args.out, "dv4_proj_weights.safetensors"); mx.save_safetensors(p, out, metadata={"model": "DV4-Flash-MXFP4-MLX"})
 json.dump(meta, open(os.path.join(args.out, "dv4_proj_weights.json"), "w"), indent=1)
 print(f"weights: {len(out)} tensors, {os.path.getsize(p)/1e9:.3f} GB, {time.time()-t0:.1f}s; layer2 wkv kind {meta['layers']['2']['wkv_kind']}, comp {meta['layers']['2']['comp_wkv_kind']}", flush=True)
 caps = mx.load(args.captures); hl = [int(s) for s in args.hidden_layers.split(",")]
