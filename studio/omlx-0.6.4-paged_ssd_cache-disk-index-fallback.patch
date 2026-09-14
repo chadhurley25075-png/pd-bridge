@@ -1,6 +1,6 @@
---- paged_ssd_cache.py	2026-09-08 06:58:06
-+++ paged_ssd_cache.py	2026-09-08 06:58:06
-@@ -4105,7 +4105,43 @@
+--- paged_ssd_cache.py
++++ paged_ssd_cache.py
+@@ -4105,8 +4105,44 @@
          Returns:
              PagedSSDBlockMetadata if found, None otherwise.
          """
@@ -9,7 +9,7 @@
 +        if found is None:
 +            found = self._pd_index_from_disk(block_hash)
 +        return found
-+
+ 
 +    def _pd_index_from_disk(self, block_hash: bytes):
 +        """pd-bridge: the startup scan is the only indexer upstream, so blocks written by an
 +        external producer (the Spark prefill bridge) were invisible until restart. On an index
@@ -42,6 +42,19 @@
 +        except Exception as e:  # never let the fallback break a lookup
 +            logger.warning("[pd] disk fallback failed for block: %s" % e)
 +            return None
- 
++
      def has_block(self, block_hash: bytes) -> bool:
+         """
+         Check if a block exists in cache (hot cache, pending writes, or SSD storage).
+@@ -4127,7 +4163,10 @@
+         with self._pending_write_hashes_lock:
+             if block_hash in self._pending_write_buffers:
+                 return True
+-        return False
++        # pd-bridge: a new request's prefix walk (PagedCacheManager lazy restore) asks has_block(), not
++        # get_block_metadata(), so the disk fallback must answer here too or externally written blocks are
++        # never found — oMLX then prefills natively and overwrites the bridge's files with its own.
++        return self._pd_index_from_disk(block_hash) is not None
+ 
+     def preload_matched_blocks(self, block_hashes: list[bytes]) -> int:
          """

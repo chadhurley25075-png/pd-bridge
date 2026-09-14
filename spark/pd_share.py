@@ -3,6 +3,7 @@
 which is single-threaded and drops connections under the front door's poll+fetch pattern → RemoteDisconnected)."""
 import http.server, os, socketserver, sys, json
 ROOT=sys.argv[1] if len(sys.argv)>1 else os.path.expanduser("~/pd_capture"); PORT=int(sys.argv[2]) if len(sys.argv)>2 else 8010
+HOST=os.environ.get("PD_SHARE_HOST","0.0.0.0")   # bind to the bridge link only; captures are prompt KV
 class H(http.server.SimpleHTTPRequestHandler):
     protocol_version="HTTP/1.1"
     def __init__(self,*a,**k): super().__init__(*a,directory=ROOT,**k)
@@ -21,4 +22,4 @@ class H(http.server.SimpleHTTPRequestHandler):
             self.send_header("Content-Length",str(len(b))); self.end_headers(); self.wfile.write(b); return
         return super().do_GET()
 class S(socketserver.ThreadingMixIn, http.server.HTTPServer): daemon_threads=True; allow_reuse_address=True
-S(("0.0.0.0",PORT),H).serve_forever()
+S((HOST,PORT),H).serve_forever()
