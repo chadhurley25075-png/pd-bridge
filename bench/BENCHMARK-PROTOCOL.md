@@ -37,3 +37,17 @@ match. Also: marker-found must be 3/3 at every size on the bridged path.
 ## What we will NOT publish
 Derived compute floors as if measured; the (operator) seat prompt as a benchmark input; any number from a run with the build swap present;
 warm-turn numbers as if they were bridged (warm turns bypass the bridge by design).
+
+## The three fields every row must carry (2026-09-14)
+
+`bench/bench_cold.py` now lifts them to the top level of each JSON line, and `bench/summarize_bench.py` prints one
+line per row with all three:
+
+| field | source | what a bad value looks like |
+|---|---|---|
+| `verdict` | the front door's `X-PD-Bridge` header: `complete`, `partial B/T`, `salvage B/T`, `skipped: …`, `declined: …`; `native` when there is no header | a fast time with `native`/`declined` — you measured the decoder alone |
+| `transport` | `X-PD-Bridge.transport` (`tcp10`, `rdma2`, `rdma4`); `none` for skipped/declined/native | a bridged verdict with `unknown` — an old front door; the number has no wire |
+| `cached_tokens` | `usage.prompt_tokens_details.cached_tokens` from the decoder's final stream chunk (`stream_options.include_usage`) | `complete` with `cached_tokens` far below `prompt_tokens` — the decoder did NOT hit the bridged prefix, whatever the header says |
+
+The operator's run scripts call `summarize_bench.py` on their logs so these three are visible next to every TTFT.
+

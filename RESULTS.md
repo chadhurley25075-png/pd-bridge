@@ -37,6 +37,8 @@ the bottleneck (7.6 GB in 7.2 s at 988K).
 
 **`partial` is the memory floor, not a failure.** See *Known limits* in the README: the capture
 crosses the prefill box's free-memory floor near 772K tokens and seals a valid contiguous prefix.
+The streaming capture (`docs/STREAMING-CAPTURE.md`, `PD_STREAM=1`) is designed to make these rows `complete`;
+it is CPU-tested and staged, **not yet measured on the pair** — no number here is from it.
 
 ### Correctness at depth
 

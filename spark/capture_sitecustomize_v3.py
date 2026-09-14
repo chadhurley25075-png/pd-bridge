@@ -45,7 +45,8 @@ Env: PD_CAPTURE_DIR (arms the hook) · PD_CAPTURE_IDLE_S=2.0 · PD_CAPTURE_BLOCK
      PD_CAPTURE_MIN_T=64 (discard shorter captures) · PD_CAPTURE_PIECE=0 (0 = never split a chunk;
      >0 = projection piece rows) · PD_CAPTURE_OPCOUNT=1 (sample the aten-op count of ONE worker item) ·
      PD_PROJ_WEIGHTS · PD_POOL_PATH (extra import dir for pd_pool_torch) · PD_CAPTURE_V3_NOARM=1 (import
-     without installing the import hook; the selftest uses it).
+     without installing the import hook; the selftest uses it) · PD_STREAM=1 (ship each finished block
+     boundary as seg_<b>.safetensors DURING prefill and release it — docs/STREAMING-CAPTURE.md; default off).
 """
 import importlib.abc
 import importlib.machinery
@@ -62,6 +63,91 @@ _DIR = os.environ.get("PD_CAPTURE_DIR")
 _IDLE_S = float(os.environ.get("PD_CAPTURE_IDLE_S", "2.0"))
 _BLOCK = int(os.environ.get("PD_CAPTURE_BLOCK", "2048"))
 _MIN_T = int(os.environ.get("PD_CAPTURE_MIN_T", "64"))
+# --- 2026-09-08 SURVIVAL GUARDS (added after the 1,021,199-token wedge on the prefill head) ---------------
+# The capture is held on-device for the whole request (~9,876 bytes/token measured over 43 layers).
+# At 1.02M tokens that is ~10.1 GB against ~16.8 GB free on a loaded GB10, and _finish then added
+# host copies per layer WITHOUT freeing the layers it had already written. It died after 11 of 43
+# layers and drove the box into swap thrash: no sshd, no CNS, physical power cycle required.
+# These guards make that failure structurally impossible. They never shrink the prompt.
+_MEM_FLOOR = float(os.environ.get("PD_CAPTURE_MEM_FLOOR_GB", "5.0")) * (1 << 30)
+_DISK_FLOOR = float(os.environ.get("PD_CAPTURE_DISK_FLOOR_GB", "40.0")) * (1 << 30)
+_GUARD_EVERY = int(os.environ.get("PD_CAPTURE_GUARD_EVERY", "64"))
+# Measured on this model: 966,274,048 capture bytes for T=97,840 over 43 layers.
+_BYTES_PER_TOKEN = float(os.environ.get("PD_CAPTURE_BYTES_PER_TOKEN", "9876"))
+# Only abort when OUR OWN capture is big enough to plausibly be what is eating the box. vLLM's
+# startup warmup drives MemAvailable to ~1.3 GB while it allocates the KV arena, and the capture
+# alive at that moment is ~26 MB — aborting there is a false positive that silently disarms the
+# bridge for the rest of the container's life.
+_MIN_ABORT_BYTES = float(os.environ.get("PD_CAPTURE_MIN_ABORT_GB", "0.5")) * (1 << 30)
+# Every chunk builds big transient tensors (torch.cat of tail+chunk, per-boundary .clone()).
+# Torch's caching allocator keeps those freed blocks, and on GB10's UNIFIED pool a cached block
+# is a page the OS cannot have back — so MemAvailable falls much faster than the capture's own
+# on-disk size (9,876 B/token) predicts. Trimming the cache periodically returns them.
+# 0 disables. Counted in layer-chunk ingests: 43 layers/chunk, so 344 = every 8 chunks.
+# 2026-09-08: DEFAULT OFF. Measured headroom-per-token was 22.3 KB before the trim and 29.4/21.2
+# after — noise around the same number, no benefit. It is also the only change that can touch live
+# data (empty_cache() while a side CUDA stream still holds captured tensors). Unproven optimisation
+# on top of a correctness risk = off. Set PD_CAPTURE_TRIM_EVERY>0 to re-enable for an experiment.
+_TRIM_EVERY = int(os.environ.get("PD_CAPTURE_TRIM_EVERY", "0"))
+_KEEP_CAPTURES = int(os.environ.get("PD_CAPTURE_KEEP", "3"))
+# --- STREAMING CAPTURE (PD_STREAM=1; docs/STREAMING-CAPTURE.md) ------------------------------------
+# Default OFF: the capture is held on-device for the whole request and written at the end (the path every
+# number in RESULTS.md was measured on). ON: every finished decoder block boundary b (multiple of
+# PD_CAPTURE_BLOCK) is shipped as <stamp>/seg_<b>.safetensors the moment ALL layers have ingested the
+# chunk that completes it, and its device state (kvwin snapshot, pooled rows, prev rows) is released.
+# The capture's device footprint then stays O(one chunk) instead of O(T), so the free-memory seal below
+# only fires when shipping itself has stalled. The Mac assembler consumes segments in boundary order
+# while the prefill is still running. manifest.json + DONE still come last and list the segments.
+_STREAM = os.environ.get("PD_STREAM", "0") == "1"
+_SEG_FMT = "seg_{b:08d}.safetensors"
+
+
+def _free_device_bytes():
+    """Free bytes in the unified pool, or None when it cannot be determined.
+
+    2026-09-08: this MUST read /proc/meminfo MemAvailable, not torch.cuda.mem_get_info().
+    On GB10 the CPU and GPU share one pool, and the driver-level "free" reported by CUDA sits
+    near zero at steady state because vLLM has already reserved its arena — the capture then
+    allocates out of torch's own cached blocks. Driver-free would abort every capture.
+    MemAvailable is the number that actually tracked the wedge: ~16.8 GB with the model loaded,
+    collapsing toward zero as the 1,021,199-token capture grew past 10 GB."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except Exception:
+        pass
+    try:
+        import torch
+        return torch.cuda.mem_get_info()[0]
+    except Exception:
+        return None
+
+
+def _free_disk_bytes(path):
+    try:
+        st = os.statvfs(path)
+        return st.f_bavail * st.f_frsize
+    except Exception:
+        return None
+
+
+def _prune_captures(root, keep=None):
+    """Keep only the newest `keep` finished capture dirs. Never touches the live one."""
+    keep = _KEEP_CAPTURES if keep is None else keep
+    try:
+        names = sorted(n for n in os.listdir(root)
+                       if os.path.isdir(os.path.join(root, n)) and re.match(r"^\d{8}-\d{6}-\d{3}$", n))
+    except Exception:
+        return
+    for n in names[:-keep] if keep > 0 else names:
+        try:
+            shutil.rmtree(os.path.join(root, n), ignore_errors=True)
+            _log(f"pruned old capture {n}")
+        except Exception:
+            pass
+
 _PIECE = int(os.environ.get("PD_CAPTURE_PIECE", "0"))
 _OPCOUNT = os.environ.get("PD_CAPTURE_OPCOUNT", "1") != "0"
 _WEIGHTS = os.environ.get("PD_PROJ_WEIGHTS", "/pd_v3/dv4_proj_weights.safetensors")
@@ -282,7 +368,8 @@ class _PoolState:
         self.coff = 2 if ratio == 4 else 1
         self.out_dim = self.coff * head_dim
         self.ape, self.norm_w, self.eps, self.rope = ape, norm_w, eps, rope
-        self.pooled = []                      # list of [p_i, head_dim]
+        self.pooled = []                      # list of [p_i, head_dim]  (streaming: only rows not yet shipped)
+        self.shipped = 0                      # pooled rows already shipped in segments (streaming); 0 otherwise
         self.carry = None
         self.tail = None                      # [<=_TAIL_RAW, 2*out_dim] raw kv_score rows
         self.prev = {}                        # b -> raw rows [4, 2*out_dim]  (ratio 4 only)
@@ -319,11 +406,40 @@ class _PoolState:
         self.next_pos = start + n
         self.rows += n
 
-    def export(self, out, T):
+    def pooled_rows(self):
+        """Pooled rows produced so far (shipped + still held)."""
+        return self.shipped + sum(int(p.shape[0]) for p in self.pooled)
+
+    def take_pooled(self, upto):
+        """Streaming: detach and return pooled rows [self.shipped, upto) as one tensor, releasing them
+        from self.pooled. Raises if pool_layer has not produced them yet (a boundary emitted too early
+        would ship a hole — refuse rather than guess)."""
+        import torch
+        need = upto - self.shipped
+        if need < 0:
+            raise ValueError(f"take_pooled({upto}) below shipped={self.shipped}")
+        have = self.pooled_rows()
+        if upto > have:
+            raise ValueError(f"take_pooled({upto}): only {have} pooled rows exist (ratio {self.ratio})")
+        got, taken = [], 0
+        while taken < need:
+            p = self.pooled.pop(0)
+            k = min(int(p.shape[0]), need - taken)
+            got.append(p[:k])
+            if k < int(p.shape[0]):
+                self.pooled.insert(0, p[k:])
+            taken += k
+        self.shipped = upto
+        if not got:
+            return torch.empty((0, self.head_dim), dtype=torch.bfloat16)
+        return got[0] if len(got) == 1 else torch.cat(got, 0)
+
+    def export(self, out, T, tail_key=False):
         import torch
         pre = "idx_" if self.kind == "idx" else ""
         if self.pooled:
-            out[f"{pre}pooled"] = torch.cat(self.pooled, 0)
+            # streaming: whatever is left after the last emitted boundary goes out as *_pooled_tail
+            out[f"{pre}pooled_tail" if tail_key else f"{pre}pooled"] = torch.cat(self.pooled, 0)
         rem = T % self.ratio
         if self.tail is not None:
             tl = self.tail.shape[0]
@@ -354,8 +470,25 @@ class _Req:
         self.last_t = self.first_t
         self.calls = 0
         self.partial_start = None
+        # streaming bookkeeping (PD_STREAM=1): boundaries shipped so far, last one, bytes, first error
+        self.emitted_b = 0
+        self.segments = []
+        self.seg_bytes = 0
+        self.seg_write_s = 0.0
+        self.stream_error = None
         with open(os.path.join(self.dir, "manifest.json"), "w") as f:
-            json.dump({"version": _VERSION, "stamp": stamp, "T": None, "started_at": self.first_t}, f)
+            json.dump({"version": _VERSION, "stamp": stamp, "T": None, "started_at": self.first_t,
+                       "stream": _STREAM, "segment_file": _SEG_FMT}, f)
+
+    def free_layer(self, li):
+        """Release one layer's device accumulators. Called right after its file is written so the
+        write loop's peak is ONE layer instead of the whole capture."""
+        self.kv.pop(li, None)
+        self.main.pop(li, None)
+        self.idx.pop(li, None)
+
+    def free_all(self):
+        self.kv.clear(); self.main.clear(); self.idx.clear()
 
 
 # ----------------------------------------------------------------------------- the capture
@@ -370,9 +503,10 @@ class _Capture:
 
     _FLUSH = _Flush("idle")     # legacy sentinel (tests)
 
-    def __init__(self, root=_DIR, idle_s=_IDLE_S, weights=None, start_threads=True):
+    def __init__(self, root=_DIR, idle_s=_IDLE_S, weights=None, start_threads=True, stream=None):
         self.root = root
         self.idle_s = idle_s
+        self.stream_mode = _STREAM if stream is None else bool(stream)
         self.weights = weights or _Weights()
         self.q = queue.Queue()
         self.rank = None
@@ -523,6 +657,12 @@ class _Capture:
                 if start != 0:
                     self.req.partial_start = start
                     _log(f"WARNING request starts at position {start} (prefix hit?) — capture will be partial")
+                _prune_captures(self.root)
+                _df = _free_disk_bytes(self.root)
+                if _df is not None and _df < _DISK_FLOOR:
+                    _log(f"free disk {_df/(1<<30):.1f} GB < floor {_DISK_FLOOR/(1<<30):.1f} GB")
+                    self._abort("disk-floor")
+                    return
             r = self.req
             r.kv.setdefault(li, _KVState()).feed(kv_pre, start)
             if kv_score is not None:
@@ -539,6 +679,55 @@ class _Capture:
                 r.idx[li].feed(idx, start)
             r.calls += 1
             r.last_t = time.time()
+            if self.stream_mode:
+                # ship every boundary this chunk completed, release its device state
+                self._stream_emit(r)
+                if r.stream_error is not None:
+                    # a segment failed to land (disk, I/O, a hole in the pooled rows): everything up to
+                    # emitted_b is already on the share, so seal THERE instead of carrying on with state
+                    # the Mac can never receive. The seal writes manifest + DONE; the front salvages.
+                    _log(f"stream error ({r.stream_error}) — sealing at emitted_T={r.emitted_b}")
+                    self._finish("stream-error")
+                    return
+            if _TRIM_EVERY > 0 and (r.calls % _TRIM_EVERY) == 0:
+                try:
+                    import torch
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+            if _GUARD_EVERY > 0 and (r.calls % _GUARD_EVERY) == 0:
+                _fb = _free_device_bytes()
+                if _fb is not None and _fb < _MEM_FLOOR:
+                    _T = max([st.next_pos for st in r.kv.values()] or [0])
+                    # streaming: only the UNSHIPPED tail is still on this box. Everything up to emitted_b
+                    # has been written out and released, so the estimate — and therefore the seal — now
+                    # tracks the backlog, not the prompt. A healthy stream never crosses _MIN_ABORT_BYTES.
+                    _held_T = (_T - r.emitted_b) if self.stream_mode else _T
+                    _est = _held_T * _BYTES_PER_TOKEN
+                    if _est >= _MIN_ABORT_BYTES:
+                        # SEAL, don't discard. Everything captured so far is a VALID contiguous
+                        # prefix [0, _T); the front door salvages any clean prefix above
+                        # PD_MIN_COVERAGE (0.5) and lets oMLX natively prefill only the tail.
+                        # Throwing it away sent the Mac back to prefilling the WHOLE prompt
+                        # natively — hours instead of minutes. _finish frees each layer as it
+                        # writes, so sealing releases the same memory an abort would.
+                        _log(f"free memory {_fb/(1<<30):.2f} GB < floor {_MEM_FLOOR/(1<<30):.2f} GB "
+                             f"and this capture already holds ~{_est/(1<<30):.2f} GB at T~{_T}"
+                             f"{f' (unshipped since {r.emitted_b})' if self.stream_mode else ''} — "
+                             f"SEALING the prefix here so the box stays reachable and the bridge "
+                             f"still carries [0,{_T})")
+                        try:
+                            self._finish("mem-floor-seal")
+                        except Exception as e:
+                            _log(f"seal failed ({e!r}) — falling back to a hard abort")
+                            self._abort("mem-floor")
+                        else:
+                            try:
+                                import torch
+                                torch.cuda.empty_cache()
+                            except Exception:
+                                pass
+                        return
 
     def _process(self, li, hidden, ch, ev):
         """Worker thread. Side stream current. Device-side wait on the compute-stream event, then the
@@ -721,6 +910,116 @@ class _Capture:
                 return self._finish(reason)
         return None
 
+    # -- streaming (lock held, worker thread, side stream current) --------------------------------
+    def _num_layers(self):
+        """Decoder layers the capture will see = layers in the projection weights (the MTP layer is never
+        captured and has no weights). None until the weights are loaded."""
+        cpu = getattr(self.weights, "cpu", None)
+        return len(cpu) if cpu else None
+
+    def _stream_emit(self, r, final=False, T=None):
+        """Ship every boundary b with r.emitted_b < b <= E as seg_<b>.safetensors and release its state.
+        Mid-request (final=False) a boundary is complete only when EVERY layer has ingested the chunk that
+        covers it: the forward thread hands the worker one item per layer per chunk in layer order, so
+        "all layers present and calls % num_layers == 0" == "a whole chunk has landed", and
+        E = min(next_pos) is the position every layer has reached. At finish (final=True) E = T."""
+        if r.stream_error is not None or r.partial_start:
+            # a request that began mid-prompt (prefix hit / resumed after a seal) can never seed blocks from
+            # token 0, so the front door discards it anyway (usable_prefix=0): nothing to stream
+            return
+        nl = self._num_layers()
+        if final:
+            E = T if T is not None else min([st.next_pos for st in r.kv.values()] or [0])
+        else:
+            if not nl or len(r.kv) != nl or (r.calls % nl) != 0:
+                return
+            E = min(st.next_pos for st in r.kv.values())
+        for b in _boundaries(r.emitted_b, E):
+            t0 = time.time()
+            try:
+                nbytes = self._emit_segment(r, b)
+            except Exception as e:
+                r.stream_error = f"segment {b}: {e!r}"
+                _log(f"stream: FAILED to emit boundary {b}: {e!r}")
+                return
+            r.seg_write_s += time.time() - t0
+            r.segments.append(b)
+            r.seg_bytes += nbytes
+            r.emitted_b = b
+        if r.segments and (len(r.segments) % 16 == 0 or final):
+            _log(f"stream: {len(r.segments)} segments, emitted_T={r.emitted_b}, {r.seg_bytes/1e6:.1f} MB, "
+                 f"write {r.seg_write_s:.2f}s{' (final)' if final else ''}")
+
+    def _emit_segment(self, r, b):
+        """One boundary -> one file holding, for EVERY layer, exactly the tensors the Mac assembler needs to
+        build the decoder state at b beyond what earlier segments carried:
+          layer_XX.kvwin_<b>                 [128,512]  pre-RoPE SWA rows [b-128, b)
+          layer_XX.pooled_<b>                rows [prev_b//ratio, b//ratio) of the compressor cache  (ratio>0)
+          layer_XX.prev_kv_<b>/prev_gate_<b> [4, out_dim] raw rows [b-4, b)                             (ratio 4)
+          layer_XX.idx_pooled_<b> / idx_prev_kv_<b> / idx_prev_gate_<b>   the indexer's, same shapes    (ratio 4)
+        Copies D2H on the side stream (the worker's current stream), writes .tmp, renames, and only then
+        drops the device tensors — a crash mid-write leaves no half segment and no lost state."""
+        import torch
+        from safetensors.torch import save_file
+
+        def _host(t):
+            t = t.detach()
+            if t.dtype != torch.bfloat16:
+                t = t.to(torch.bfloat16)
+            return t.contiguous().cpu()
+
+        host = {}
+        # pass 1: prove every tensor exists WITHOUT mutating state, so a refused boundary leaves the
+        # accumulators exactly as they were (the seal then still exports them correctly)
+        for li in sorted(r.kv):
+            pre = f"layer_{li:02d}."
+            snap = r.kv[li].snaps.get(b)
+            if snap is None:
+                raise KeyError(f"kvwin_{b} missing for layer {li} (next_pos={r.kv[li].next_pos})")
+            host[pre + f"kvwin_{b}"] = _host(snap)
+            for kind, st in (("", r.main.get(li)), ("idx_", r.idx.get(li))):
+                if st is None:
+                    continue
+                upto = b // st.ratio
+                if st.pooled_rows() < upto:
+                    raise ValueError(f"layer {li} {kind or 'main'}: {st.pooled_rows()} pooled rows < {upto} needed at b={b}")
+                if st.ratio == 4 and b not in st.prev:
+                    raise KeyError(f"{kind}prev_{b} missing for layer {li}")
+        # every tensor exists: now take them (this mutates state, so it runs only after the checks above)
+        for li in sorted(r.kv):
+            pre = f"layer_{li:02d}."
+            for kind, st in (("", r.main.get(li)), ("idx_", r.idx.get(li))):
+                if st is None:
+                    continue
+                host[pre + f"{kind}pooled_{b}"] = _host(st.take_pooled(b // st.ratio))
+                if st.ratio == 4:
+                    prev = st.prev.pop(b)
+                    host[pre + f"{kind}prev_kv_{b}"] = _host(prev[:, :st.out_dim])
+                    host[pre + f"{kind}prev_gate_{b}"] = _host(prev[:, st.out_dim:])
+        path = os.path.join(r.dir, _SEG_FMT.format(b=b))
+        save_file(host, path + ".tmp")
+        os.replace(path + ".tmp", path)
+        for li in r.kv:                       # release the device snapshots only once the file is durable
+            r.kv[li].snaps.pop(b, None)
+        nbytes = sum(v.numel() * v.element_size() for v in host.values())
+        host.clear()
+        return nbytes
+
+    def _abort(self, reason):
+        """Drop the in-flight capture and free everything. The front door then finds no usable
+        capture, declines the bridge, and oMLX prefills natively. Slow for one turn — but the
+        Spark stays reachable, which is the whole point. Never shrinks the prompt."""
+        r, self.req = self.req, None
+        if r is not None:
+            r.free_all()
+            shutil.rmtree(r.dir, ignore_errors=True)
+        try:
+            import torch
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+        _log(f"capture ABORTED ({reason}); accumulators freed, capture dir removed")
+
     # -- writer (lock held) ------------------------------------------------------------------
     def _finish(self, reason, why=None):
         import torch
@@ -740,17 +1039,31 @@ class _Capture:
         nbytes = 0
         if self.stream is not None:
             self.stream.synchronize()
+        streaming = self.stream_mode and not r.partial_start
+        if streaming:
+            # ship the boundaries the last chunk completed; the layer files below then carry only the
+            # end state (kvwin_end, buf_*, prev_*_end) plus the pooled rows past the last boundary.
+            self._stream_emit(r, final=True, T=min([s.next_pos for s in r.kv.values()] or [T]))
+        # 2026-09-08: collect the per-layer bookkeeping BEFORE the write loop, because the loop now
+        # frees each layer's device tensors the moment its file lands. Holding all 43 layers live
+        # through the whole write is what wedged the prefill head at 1,021,199 tokens.
+        gaps = {f"layer_{li:02d}": st.gaps for li, st in r.kv.items() if st.gaps}
+        for li in layers:
+            counts[f"layer_{li:02d}"] = {"kv": r.kv[li].rows if li in r.kv else 0,
+                                        "main": r.main[li].rows if li in r.main else 0,
+                                        "idx": r.idx[li].rows if li in r.idx else 0}
+            if li in r.main:
+                ratios[li] = r.main[li].ratio
+            elif li in r.kv:
+                ratios[li] = 0
         for li in layers:
             out = {}
             if li in r.kv:
                 r.kv[li].export(out, T)
             if li in r.main:
-                r.main[li].export(out, T)
-                ratios[li] = r.main[li].ratio
-            elif li in r.kv:
-                ratios[li] = 0
+                r.main[li].export(out, T, tail_key=streaming)
             if li in r.idx:
-                r.idx[li].export(out, T)
+                r.idx[li].export(out, T, tail_key=streaming)
             host = {}
             for k, v in out.items():
                 v = v.detach()
@@ -761,10 +1074,19 @@ class _Capture:
             path = os.path.join(r.dir, f"layer_{li:02d}.safetensors")
             save_file(host, path + ".tmp")
             os.replace(path + ".tmp", path)
-            counts[f"layer_{li:02d}"] = {"kv": r.kv[li].rows if li in r.kv else 0,
-                                        "main": r.main[li].rows if li in r.main else 0,
-                                        "idx": r.idx[li].rows if li in r.idx else 0}
-        gaps = {f"layer_{li:02d}": st.gaps for li, st in r.kv.items() if st.gaps}
+            # release this layer NOW — device accumulators, the exported views, and the host copy
+            out.clear(); host.clear()
+            del out, host
+            r.free_layer(li)
+            if (li % 8) == 7:
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
         meta = {"version": _VERSION, "T": T, "num_layers": num_layers, "ratios": ratios, "boundaries": bounds,
                 "end": T, "stamp": r.stamp, "block": _BLOCK, "window": _WIN, "layers_written": len(layers),
                 "tokens_per_layer": counts, "calls": r.calls, "capture_span_s": round(r.last_t - r.first_t, 3),
@@ -777,7 +1099,16 @@ class _Capture:
                 "launches_per_call": (self.opcount or {}).get("aten_ops_total"),
                 "launches_note": "sampled aten-op count of ONE ratio-4 layer-chunk (upper-bound proxy for kernel launches; not a hardware count)",
                 "aten_ops_sample": self.opcount, "piece": _PIECE, "partial_start": r.partial_start,
-                "position_gaps": gaps, "worker_errors": self.errors}
+                "position_gaps": gaps, "worker_errors": self.errors,
+                # streaming record: which boundaries went out as segments (in order), the last one, bytes,
+                # and the first error. A consumer trusts a boundary b only if b is in `segments` AND the
+                # file is on the share; layer files in stream mode hold the END STATE only.
+                "stream": {"enabled": streaming, "segments": r.segments, "emitted_T": r.emitted_b,
+                           "segment_file": _SEG_FMT, "segment_bytes": r.seg_bytes,
+                           "segment_write_s": round(r.seg_write_s, 3), "error": r.stream_error,
+                           "layer_files": ("end-state only: kvwin_end, buf_*, prev_*_end, *pooled_tail"
+                                           if streaming else "full capture"),
+                           "note": ("partial_start: streaming disabled for this request" if (self.stream_mode and r.partial_start) else None)}}
         with open(os.path.join(r.dir, "manifest.json"), "w") as f:
             json.dump(meta, f, indent=1, default=str)
         with open(os.path.join(r.dir, "DONE"), "w") as f:
@@ -787,7 +1118,9 @@ class _Capture:
              f"span={meta['capture_span_s']}s, write={meta['write_s']}s, {nbytes/1e6:.1f} MB ({reason}); "
              f"enqueue={self.enqueue_s:.2f}s worker={self.pool_s:.2f}s (project {self.project_s:.2f}s) "
              f"items={self.items} chunks={self.chunks} host_syncs={self.host_syncs}"
-             + (f" WARNING gaps={gaps}" if gaps else "") + (f" PARTIAL start={r.partial_start}" if r.partial_start else ""))
+             + (f" WARNING gaps={gaps}" if gaps else "") + (f" PARTIAL start={r.partial_start}" if r.partial_start else "")
+             + (f" STREAM segments={len(r.segments)} emitted_T={r.emitted_b} {r.seg_bytes/1e6:.1f} MB"
+                + (f" ERROR={r.stream_error}" if r.stream_error else "") if streaming else ""))
         return r.dir
 
 
@@ -868,4 +1201,4 @@ if _DIR and os.environ.get("PD_CAPTURE_V3_NOARM") != "1":
     else:
         sys.meta_path.insert(0, _PostImportFinder())
     _log(f"v3.1 armed (pooled capture with Mac weights, launch-lean; dir={_DIR}, idle {_IDLE_S}s, block {_BLOCK}, "
-         f"weights={_WEIGHTS}, piece={_PIECE or 'none'})")
+         f"weights={_WEIGHTS}, piece={_PIECE or 'none'}, stream={'ON (PD_STREAM=1: segments during prefill)' if _STREAM else 'off'})")

@@ -48,7 +48,7 @@ HOOK="$PD_V3/capture_sitecustomize_v3.py"
 
 HOOK_MOUNT=(-v "$HOOK:/opt/env/lib/python3.12/site-packages/sitecustomize.py:ro"
             -e PD_CAPTURE_DIR=/pd_capture -e PD_CAPTURE_IDLE_S=2.0
-            -e PD_POOL_PATH=/pd_v3 -e PD_PROJ_WEIGHTS=/pd_v3/dv4_proj_weights.safetensors)
+            -e PD_POOL_PATH=/pd_v3 -e PD_PROJ_WEIGHTS=/pd_v3/dv4_proj_weights.safetensors -e PD_STREAM=${PD_STREAM:-0})
 [ "${PD_HOOK:-on}" = "off" ] && HOOK_MOUNT=() && HOOK="(none - control run)"
 echo "hook=$HOOK  pd_v3=$PD_V3  rank=$NODE_RANK"
 
