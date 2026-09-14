@@ -1,0 +1,4 @@
+# build outputs (make -C rdma)
+pd_rdma
+libpd_rdma_tx.so
+*.pre-async

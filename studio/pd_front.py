@@ -25,8 +25,12 @@ PD_OMLX=os.environ.get("PD_OMLX","http://127.0.0.1:8011")
 PD_CACHE_DIR=os.environ.get("PD_CACHE_DIR",os.path.expanduser("~/.omlx/cache"))
 PD_MIN_TOKENS=int(os.environ.get("PD_MIN_TOKENS","4096"))
 PD_MIN_TAIL=int(os.environ.get("PD_MIN_TAIL","8192"))   # pooled mode: bridge when the uncached tail is at least this many tokens
-PD_MODE=os.environ.get("PD_MODE","hidden")   # "hidden" = v2 hidden-state capture+rebuild, "pooled" = v3 pooled capture+assemble
+PD_MODE=os.environ.get("PD_MODE","hidden")   # "hidden" = v2 hidden-state capture+rebuild, "pooled" = v3 pooled capture+assemble, "kv" = plain-attention K/V blocks (docs/RDMA.md)
 PD_PULL_DIR=os.path.expanduser(os.environ.get("PD_PULL_DIR","~/pd_lab/pd_pull"))
+PD_SPARK_MODEL=os.environ.get("PD_SPARK_MODEL","deepseek-v4-flash")   # served model name on the prefill engine
+PD_SHARE_PORT=int(os.environ.get("PD_SHARE_PORT","8010"))               # capture share on the prefill head
+PD_BLOCK=int(os.environ.get("PD_BLOCK","256" if PD_MODE=="kv" else "2048"))   # decoder's paged_cache_block_size
+PD_TRANSPORT=os.environ.get("PD_TRANSPORT","tcp10")                       # recorded in every verdict: a number without its transport is not a number
 # 9/6 (FINDING-bench4-cold-fallback.md): capture-trust knobs. The hook can flush MID-REQUEST during
 # chunked prefill (DONE + manifest T < request T) and a T-correct capture can still miss tail-boundary
 # data. The front validates every DONE capture, prefers a complete one, salvages the best contiguous
@@ -42,15 +46,21 @@ def L(*a):
     s=time.strftime("%H:%M:%S ")+" ".join(map(str,a)); print(s,flush=True); LOG.write(s+"\n"); LOG.flush()
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from omlx.patches.deepseek_v4 import apply_deepseek_v4_patch; apply_deepseek_v4_patch()
+if PD_MODE!="kv":   # DV4 only; a plain-attention model needs neither the patch nor resident weights
+    from omlx.patches.deepseek_v4 import apply_deepseek_v4_patch; apply_deepseek_v4_patch()
 from mlx_lm import load
 from mlx_lm.models.base import create_attention_mask
 from mlx_lm.models.cache import CacheList
 import omlx_block_writer  # sister B's writer: write_blocks(cache_list, token_ids, model_name, out_dir) -> paths
 
+try: PD_MODEL_TYPE=json.load(open(os.path.join(PD_MODEL,"config.json"))).get("model_type") or "deepseek_v4"
+except Exception: PD_MODEL_TYPE="deepseek_v4"
 t0=time.time(); MODEL,TOK=load(PD_MODEL, lazy=True)
-for layer in MODEL.model.layers: mx.eval(layer.attn.parameters())
-L(f"attention-only model resident in {time.time()-t0:.1f}s, active mem {mx.get_active_memory()/1e9:.1f} GB")
+if PD_MODE=="kv":
+    L(f"kv mode: tokenizer + cache geometry only, weights stay lazy ({time.time()-t0:.1f}s, model_type {PD_MODEL_TYPE})")
+else:
+    for layer in MODEL.model.layers: mx.eval(layer.attn.parameters())
+    L(f"attention-only model resident in {time.time()-t0:.1f}s, active mem {mx.get_active_memory()/1e9:.1f} GB")
 LOCK=threading.Lock()
 
 # ---- prompt rendering: oMLX's OWN chain (server.py create_chat_completion → VLMBatchedEngine._apply_chat_template),
@@ -74,7 +84,7 @@ def render_request(raw_json):
         try: ms=_MSM.get_settings(req.model)
         except Exception: ms=None
     merged=merge_chat_template_request_kwargs(ms, merge_reasoning_effort_chat_template_kwargs(req.chat_template_kwargs, req.reasoning_effort))
-    native=uses_native_reasoning_content(req.model, config_model_type="deepseek_v4", engine_model_type="deepseek_v4",
+    native=uses_native_reasoning_content(req.model, config_model_type=PD_MODEL_TYPE, engine_model_type=PD_MODEL_TYPE,
                                          preserve_thinking_default=(ms.preserve_thinking if ms else None))
     msgs=extract_multimodal_content(req.messages, (ms.max_tool_result_tokens if ms else None), TOK,
                                     native_reasoning_content=native, consolidate_system_messages=False)
@@ -93,10 +103,10 @@ def render_request(raw_json):
     return list(map(int, TOK.encode(prompt))), req.model
 
 def cached_prefix_tokens(ids):
-    """How many leading tokens oMLX already holds as SSD blocks for this exact prompt (chain hashes, 2048/block)."""
+    """How many leading tokens oMLX already holds as SSD blocks for this exact prompt (chain hashes, PD_BLOCK/block)."""
     try:
         from omlx_block_writer import chain_hashes_for
-        hs=chain_hashes_for(ids, PD_MODEL_NAME)
+        hs=chain_hashes_for(ids, PD_MODEL_NAME, block_size=PD_BLOCK)
     except Exception as e:
         L("chain_hashes_for unavailable:",e); return 0
     n=0
@@ -104,7 +114,7 @@ def cached_prefix_tokens(ids):
         hx=h.hex() if isinstance(h,(bytes,bytearray)) else str(h)
         if os.path.isfile(os.path.join(PD_CACHE_DIR,hx[0],hx+".safetensors")): n+=1
         else: break
-    return n*2048
+    return n*PD_BLOCK
 
 def _http_listing(base):
     """Newest .json sidecar via the capture HTTP share (no ssh)."""
@@ -114,9 +124,9 @@ def _http_listing(base):
     return sorted(names)
 
 def spark_prefill(ids):
-    base=PD_SPARK.rsplit(":",1)[0]+":8010"
+    base=PD_SPARK.rsplit(":",1)[0]+f":{PD_SHARE_PORT}"
     before=set(_http_listing(base))
-    body=json.dumps({"model":"deepseek-v4-flash","prompt":ids,"max_tokens":1,"temperature":0}).encode()
+    body=json.dumps({"model":PD_SPARK_MODEL,"prompt":ids,"max_tokens":1,"temperature":0}).encode()
     t=time.time(); r=urllib.request.urlopen(urllib.request.Request(PD_SPARK+"/v1/completions",body,{"Content-Type":"application/json"}),timeout=900); r.read()
     t_engine=time.time()-t
     # wait for the sidecar whose token count matches (capture flushes on idle after the engine returns)
@@ -194,12 +204,12 @@ def spark_prefill_pipelined(ids, chunk=2048):
     per-layer .bin files), rebuild the caches boundary-by-boundary, and snapshot for the block writer.
     Returns (cache, writer, timings)."""
     from omlx_block_writer import BlockWriter
-    base=PD_SPARK.rsplit(":",1)[0]+":8010"; T=len(ids); ROW=4096*2
+    base=PD_SPARK.rsplit(":",1)[0]+f":{PD_SHARE_PORT}"; T=len(ids); ROW=4096*2
     before={e["name"] for e in _ls(base) if e["dir"]}
     tm={"t0":time.time()}
     eng={}
     def _engine():
-        body=json.dumps({"model":"deepseek-v4-flash","prompt":ids,"max_tokens":1,"temperature":0}).encode()
+        body=json.dumps({"model":PD_SPARK_MODEL,"prompt":ids,"max_tokens":1,"temperature":0}).encode()
         try:
             r=urllib.request.urlopen(urllib.request.Request(PD_SPARK+"/v1/completions",body,{"Content-Type":"application/json"}),timeout=900); r.read(); eng["t"]=time.time()-tm["t0"]
         except Exception as e: eng["err"]=repr(e)
@@ -262,11 +272,11 @@ def spark_prefill_pooled(ids):
     its tail chunk still yields a prefix hit) or decline loudly. Returns (writer_paths, timings); raises
     on decline — the caller falls back to native and X-PD-Bridge carries the reason."""
     from pd_assemble_blocks import assemble_and_write
-    base=PD_SPARK.rsplit(":",1)[0]+":8010"; T=len(ids)
+    base=PD_SPARK.rsplit(":",1)[0]+f":{PD_SHARE_PORT}"; T=len(ids)
     before={e["name"] for e in _ls(base) if e["dir"]}
     tm={"t0":time.time()}; eng={}
     def _engine():
-        body=json.dumps({"model":"deepseek-v4-flash","prompt":ids,"max_tokens":1,"temperature":0}).encode()
+        body=json.dumps({"model":PD_SPARK_MODEL,"prompt":ids,"max_tokens":1,"temperature":0}).encode()
         try:
             r=urllib.request.urlopen(urllib.request.Request(PD_SPARK+"/v1/completions",body,{"Content-Type":"application/json"}),timeout=900); r.read(); eng["t"]=time.time()-tm["t0"]
         except Exception as e: eng["err"]=repr(e)
@@ -339,6 +349,184 @@ def spark_prefill_pooled(ids):
     except Exception: pass
     return paths, tm
 
+_RDMA=None
+class _RdmaClient:
+    """R1 (docs/RDMA.md): a long-lived `pd_rdma client` co-process. It registers its arena once and keeps one
+    QP to `pd_rdma serve` on the Spark; each pull is one line in, one JSON line out. A dead client is restarted once,
+    and a failed pull declines the bridge — an RDMA row must never silently become a TCP row."""
+    def __init__(self):
+        here=os.path.dirname(os.path.abspath(__file__))
+        self.cmd=[os.environ.get("PD_RDMA_BIN", os.path.join(here,"..","rdma","pd_rdma")), "client",
+                  "--host", os.environ.get("PD_RDMA_HOST", PD_SPARK.split("//")[-1].rsplit(":",1)[0]),
+                  "--port", os.environ.get("PD_RDMA_PORT","18515"), "--dev", os.environ.get("PD_RDMA_DEV","mlx5_0"),
+                  "--gid-index", os.environ.get("PD_RDMA_GID_INDEX","0"), "--arena-mib", os.environ.get("PD_RDMA_ARENA_MIB","128")]
+        self.p=None
+    def _start(self):
+        self.p=subprocess.Popen(self.cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=LOG, text=True, bufsize=1)
+        first=self.p.stdout.readline()
+        if not first or not json.loads(first).get("ready"):
+            raise RuntimeError(f"pd_rdma client did not come up: {first.strip()!r} (entitlement signed? MELONDMA_* set? serve running?)")
+        L("pd_rdma client ready:", first.strip())
+    def pull(self, tag, outdir):
+        for attempt in (0,1):
+            if self.p is None or self.p.poll() is not None: self._start()
+            try:
+                self.p.stdin.write(f"PULL {tag} {outdir}\n"); self.p.stdin.flush()
+                line=self.p.stdout.readline()
+                if line: return json.loads(line)
+            except (BrokenPipeError, ValueError) as e:
+                L(f"pd_rdma client pull failed ({e!r}), attempt {attempt}")
+            self.p=None
+        raise RuntimeError("pd_rdma client died twice")
+
+def spark_prefill_kv(ids):
+    """R0 (docs/RDMA.md): plain-attention capture from spark/pd_kv_connector.py. The request carries its own
+    pd_tag, so the capture directory is known up front — no before/after listing race, no stamp guessing. Poll
+    <tag>/ for DONE, validate the manifest against the request, pull every block, assemble into KVCache and store
+    through oMLX's own writer. Raises on decline; the caller serves natively and X-PD-Bridge carries the reason."""
+    from pd_assemble_kv import assemble_and_write_kv
+    import uuid
+    base=PD_SPARK.rsplit(":",1)[0]+f":{PD_SHARE_PORT}"; T=len(ids); tag="pd"+uuid.uuid4().hex[:16]
+    tm={"t0":time.time(),"tag":tag,"transport":PD_TRANSPORT}; eng={}
+    def _engine():
+        body=json.dumps({"model":PD_SPARK_MODEL,"prompt":ids,"max_tokens":1,"temperature":0,"kv_transfer_params":{"pd_tag":tag}}).encode()
+        try:
+            r=urllib.request.urlopen(urllib.request.Request(PD_SPARK+"/v1/completions",body,{"Content-Type":"application/json"}),timeout=3600); r.read(); eng["t"]=time.time()-tm["t0"]
+        except Exception as e: eng["err"]=repr(e)
+    th=threading.Thread(target=_engine,daemon=True); th.start()
+    polls=0; t_eng_done=None; man=None
+    while True:
+        try: names={e["name"] for e in _ls(base, tag)}
+        except Exception: names=set()          # the directory appears with the first captured step
+        polls+=1
+        if names and "t_first_seen" not in tm: tm["t_first_seen"]=round(time.time()-tm["t0"],2)
+        if "DONE" in names and "manifest.json" in names:
+            man=_cap_manifest(base, tag); tm["t_done_seen"]=round(time.time()-tm["t0"],2); break
+        if "err" in eng: raise RuntimeError("spark engine: "+eng["err"])
+        if eng.get("t") is not None and t_eng_done is None:
+            t_eng_done=time.time(); tm["t_engine"]=round(eng["t"],2)
+        if t_eng_done is not None and time.time()-t_eng_done>PD_CAPTURE_GRACE:
+            raise RuntimeError(f"bridge declined: engine returned {PD_CAPTURE_GRACE:.0f}s ago and capture {tag} never committed (connector not loaded? prefix caching on?)")
+        if t_eng_done is None and not names and time.time()-tm["t0"]>PD_STAMP_TIMEOUT:
+            raise RuntimeError(f"bridge declined: no capture directory for {tag} after {PD_STAMP_TIMEOUT:.0f}s")
+        time.sleep(0.2)
+    tm["polls"]=polls
+    for k in ("t_capture_span_s","t_forward_wait_s","t_gather_sync_s","t_d2h_s","t_write_s","steps","complete","position_gaps"):   # t_gather_sync_s: pre-rename captures
+        if k in man: tm["spark_"+k]=man[k]
+    if man.get("prompt_len")!=T:
+        raise RuntimeError(f"bridge declined: capture {tag} is for {man.get('prompt_len')} tokens, request has {T} (render parity broken?)")
+    t0=time.time(); local=os.path.join(PD_PULL_DIR, tag); os.makedirs(local, exist_ok=True); pulled=0
+    if PD_TRANSPORT=="rdma":
+        global _RDMA
+        if _RDMA is None: _RDMA=_RdmaClient()
+        rr=_RDMA.pull(tag, local)
+        if not rr.get("ok"):
+            raise RuntimeError(f"bridge declined: rdma pull of {tag} failed ({rr.get('error')}) — not falling back to TCP")
+        pulled=int(rr.get("bytes",0))
+        for k in ("t_server_read_s","t_wire_s","t_client_write_s","wire_gb_per_s","files"): tm["rdma_"+k]=rr.get(k)
+    else:
+        for e in _ls(base, tag):
+            if e["dir"] or e["name"]=="DONE": continue
+            with urllib.request.urlopen(f"{base}/{tag}/{e['name']}", timeout=600) as r, open(os.path.join(local,e["name"]),"wb") as f:
+                while True:
+                    b=r.read(1<<24)
+                    if not b: break
+                    f.write(b); pulled+=len(b)
+    tm["t_pull"]=round(time.time()-t0,2); tm["pulled_gb"]=round(pulled/1e9,3)
+    try:
+        paths,ainfo=assemble_and_write_kv(local, ids, MODEL, PD_MODEL_NAME, PD_CACHE_DIR)
+    finally:
+        shutil.rmtree(local, ignore_errors=True)
+    th.join(timeout=60)
+    tm.update(ainfo); tm["t_assembled"]=round(time.time()-tm["t0"],2)
+    if "t_engine" not in tm and eng.get("t") is not None: tm["t_engine"]=round(eng["t"],2)
+    cov=ainfo["coverage"]
+    if not paths or cov<PD_MIN_COVERAGE:
+        raise RuntimeError(f"bridge declined: assembled {ainfo['B']}/{T} tokens ({cov:.0%}) < {PD_MIN_COVERAGE:.0%} minimum ({ainfo.get('stopped_at')})")
+    full_B=(T//PD_BLOCK)*PD_BLOCK   # the sub-block tail is always prefilled natively; B<full_B means blocks are genuinely missing
+    tm["verdict"]="complete" if ainfo["B"]==full_B else f"partial {ainfo['B']}/{T}"
+    return paths, tm
+
+def spark_prefill_kv_stream(ids):
+    """R2/R4 (docs/RDMA.md): the connector RDMA-writes the capture to `pd_rdma recvd` on this Mac while the
+    prefill runs; waiting is a local stat, the manifest arrives after the last block and DONE after the manifest.
+      rdma2  blocks land in PD_PULL_DIR/<tag>/ and are assembled + stored through oMLX's own writer here.
+      rdma4  the Spark builds oMLX-native block files (chain hash, header, layer tensors) and the receiver lands them
+             straight in PD_CACHE_DIR: nothing is assembled or re-stored — verify the hashes are on disk and forward."""
+    from pd_assemble_kv import assemble_and_write_kv
+    import uuid
+    T=len(ids); tag="pd"+uuid.uuid4().hex[:16]; local=os.path.join(PD_PULL_DIR, tag); omlx=PD_TRANSPORT=="rdma4"
+    tm={"t0":time.time(),"tag":tag,"transport":PD_TRANSPORT}; eng={}
+    params={"pd_tag":tag}
+    if omlx: params.update({"omlx_model":PD_MODEL_NAME,"omlx_block":PD_BLOCK})   # the connector hashes the ids exactly as oMLX will
+    if omlx and os.environ.get("PD_OMLX_STAGE")=="1":
+        # O2c: the oMLX hook (studio/pd_omlx_hooks.py) allocates the request's cache and fills it while the Spark prefills
+        try:
+            from omlx_block_writer import chain_hashes_for
+            hs=[h if isinstance(h,str) else h.hex() for h in chain_hashes_for(ids, PD_MODEL_NAME, block_size=PD_BLOCK)][:T//PD_BLOCK]
+            cfg=json.load(open(os.path.join(PD_MODEL,"config.json")))
+            body=json.dumps({"hashes":hs,"layers":cfg["num_hidden_layers"],"kv_heads":cfg["num_key_value_heads"],
+                             "head_dim":cfg.get("head_dim") or cfg["hidden_size"]//cfg["num_attention_heads"],"block":PD_BLOCK,
+                             "reserve":int(os.environ.get("PD_OMLX_RESERVE_TOKENS","1024"))}).encode()
+            tm["stage"]=json.load(urllib.request.urlopen(urllib.request.Request(PD_OMLX+"/pd/stage",body,{"Content-Type":"application/json"}),timeout=10))
+        except Exception as e:
+            tm["stage_error"]=repr(e); L(f"bridge: /pd/stage failed ({e!r}); the decoder restores from disk")
+    def _engine():
+        body=json.dumps({"model":PD_SPARK_MODEL,"prompt":ids,"max_tokens":1,"temperature":0,"kv_transfer_params":params}).encode()
+        try:
+            r=urllib.request.urlopen(urllib.request.Request(PD_SPARK+"/v1/completions",body,{"Content-Type":"application/json"}),timeout=3600); r.read(); eng["t"]=time.time()-tm["t0"]
+        except Exception as e: eng["err"]=repr(e)
+    th=threading.Thread(target=_engine,daemon=True); th.start()
+    t_eng_done=None
+    while not os.path.isfile(os.path.join(local,"DONE")):
+        if "t_first_seen" not in tm and os.path.isdir(local): tm["t_first_seen"]=round(time.time()-tm["t0"],2)
+        if "err" in eng: raise RuntimeError("spark engine: "+eng["err"])
+        if eng.get("t") is not None and t_eng_done is None:
+            t_eng_done=time.time(); tm["t_engine"]=round(eng["t"],2)
+        if t_eng_done is not None and time.time()-t_eng_done>PD_CAPTURE_GRACE:
+            shutil.rmtree(local, ignore_errors=True)
+            raise RuntimeError(f"bridge declined: engine returned {PD_CAPTURE_GRACE:.0f}s ago and no RDMA capture for {tag} arrived (pd_rdma recvd down? connector fell back to files?)")
+        time.sleep(0.02)
+    tm["t_done_seen"]=round(time.time()-tm["t0"],2)
+    try:
+        man=json.load(open(os.path.join(local,"manifest.json")))
+        for k in ("transport","landed","async","t_capture_span_s","t_forward_wait_s","t_stack_s","t_enqueue_wait_s","t_copy_s","t_wire_s","t_ack_s",
+                  "t_sender_lag_s","t_d2h_s","steps","blocks_sent","complete","position_gaps","error","cuda_host_registered"):
+            if k in man: tm["spark_"+k]=man[k]
+        if man.get("prompt_len")!=T:
+            raise RuntimeError(f"bridge declined: capture {tag} is for {man.get('prompt_len')} tokens, request has {T} (render parity broken?)")
+        if omlx:
+            if man.get("transport")!="omlx":
+                raise RuntimeError(f"bridge declined: connector sent {man.get('transport')} blocks, not oMLX-native ones (omlx_model/omlx_block rejected? see the vLLM log)")
+            # nothing to assemble: the blocks are already the decoder's own files — prove they are where it will look
+            t1=time.time(); B=cached_prefix_tokens(ids); tm["t_verify_on_disk"]=round(time.time()-t1,3)
+            n=B//PD_BLOCK
+            from omlx_block_writer import chain_hashes_for
+            paths=[os.path.join(PD_CACHE_DIR,h[0],h+".safetensors") for h in chain_hashes_for(ids, PD_MODEL_NAME, block_size=PD_BLOCK)[:n]]
+            ainfo={"blocks_ok":n,"blocks_claimed":int(man.get("blocks",0)),"B":B,"coverage":round(B/T,4) if T else 0.0,
+                   "T_manifest":man.get("T"),"T_request":T,"landed_gb":round(sum(os.path.getsize(p) for p in paths)/1e9,3)}
+            # O2b: rows after the last full block (all but the last token) -> pd_tail/<sha256(ids)> for the oMLX hook
+            tail_src=os.path.join(local,"tail.safetensors"); tm["tail_rows"]=int(man.get("tail_rows_shipped") or 0)
+            if tm["tail_rows"] and os.path.isfile(tail_src) and B==n*PD_BLOCK and B+tm["tail_rows"]==T-1:
+                import hashlib, struct
+                tail_dir=os.path.join(PD_CACHE_DIR,"pd_tail"); os.makedirs(tail_dir, exist_ok=True)
+                os.replace(tail_src, os.path.join(tail_dir, hashlib.sha256(struct.pack(f"<{T}i",*ids)).hexdigest()+".safetensors"))
+                tm["tail_landed"]=True
+        else:
+            tm["pulled_gb"]=round(sum(os.path.getsize(os.path.join(local,f)) for f in os.listdir(local))/1e9,3)
+            paths,ainfo=assemble_and_write_kv(local, ids, MODEL, PD_MODEL_NAME, PD_CACHE_DIR)
+    finally:
+        shutil.rmtree(local, ignore_errors=True)
+    th.join(timeout=60)
+    tm.update(ainfo); tm["t_assembled"]=round(time.time()-tm["t0"],2)
+    if "t_engine" not in tm and eng.get("t") is not None: tm["t_engine"]=round(eng["t"],2)
+    cov=ainfo["coverage"]
+    if not paths or cov<PD_MIN_COVERAGE:
+        raise RuntimeError(f"bridge declined: assembled {ainfo['B']}/{T} tokens ({cov:.0%}) < {PD_MIN_COVERAGE:.0%} minimum ({ainfo.get('stopped_at')})")
+    full_B=(T//PD_BLOCK)*PD_BLOCK
+    tm["verdict"]="complete" if ainfo["B"]==full_B else f"partial {ainfo['B']}/{T}"
+    return paths, tm
+
 def bridge(raw_json):
     """Returns timing dict; raises on failure (caller falls back). Single-threaded server: MLX lives on this thread."""
     with LOCK, mx.stream(mx.default_stream(mx.Device(mx.gpu))):
@@ -346,7 +534,14 @@ def bridge(raw_json):
         cached=cached_prefix_tokens(ids); L(f"bridge: {len(ids)} tokens (render {t_tok:.2f}s), cached prefix {cached}")
         if len(ids)<PD_MIN_TOKENS: return {"skipped":True,"tokens":len(ids),"why":"short"}
         tail=len(ids)-cached
+        if PD_MODE=="kv" and not os.environ.get("PD_IGNORE_CACHED") and tail>=PD_MIN_TAIL:
+            paths,tm=(spark_prefill_kv_stream if PD_TRANSPORT in ("rdma2","rdma4") else spark_prefill_kv)(ids)   # rdma2/rdma4: blocks arrive during prefill
+            moved=f"landed {tm.get('landed_gb')} GB in the oMLX cache" if PD_TRANSPORT=="rdma4" else f"received {tm.get('pulled_gb')} GB" if PD_TRANSPORT=="rdma2" else f"pulled {tm.get('pulled_gb')} GB in {tm.get('t_pull')}s"
+            L(f"bridge(kv/{PD_TRANSPORT}): engine {tm.get('t_engine')}s, DONE +{tm.get('t_done_seen')}s, {moved}, blocks {len(paths)}, done +{tm.get('t_assembled')}s, verdict {tm.get('verdict')}")
+            return {"skipped":False,"mode":"kv","tokens":len(ids),"cached_prefix":cached,"t_tokenize":round(t_tok,2),**{k:v for k,v in tm.items() if k!="t0"},"blocks":len(paths)}
         if not os.environ.get("PD_IGNORE_CACHED"):
+            if PD_MODE=="kv":
+                return {"skipped":True,"tokens":len(ids),"cached_prefix":cached,"tail":tail,"transport":PD_TRANSPORT,"why":f"warm — new tail {tail} < {PD_MIN_TAIL}, oMLX prefills it natively"}
             if PD_MODE=="pooled":
                 # v3: the Spark re-prefills the whole prompt cheaply and ships ~10 KB/token, so bridge whenever the NEW part is big.
                 if tail<PD_MIN_TAIL: return {"skipped":True,"tokens":len(ids),"cached_prefix":cached,"tail":tail,"why":f"warm — new tail {tail} < {PD_MIN_TAIL}, oMLX prefills it natively"}
@@ -391,7 +586,9 @@ class H(BaseHTTPRequestHandler):
         self.send_header("X-PD-Bridge",json.dumps(info)); self.end_headers()
         first=None
         while True:
-            chunk=r.read(65536)
+            # read1, not read: read(65536) blocks until 64 KiB or EOF, so a short SSE answer reached the client in one
+            # burst at the end and every TTFT measured through the front equalled total time (found 2026-09-14)
+            chunk=r.read1(65536) if hasattr(r,"read1") else r.read(65536)
             if not chunk: break
             if first is None: first=time.time()-t
             self.wfile.write(chunk); self.wfile.flush()
