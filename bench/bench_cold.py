@@ -19,8 +19,10 @@ doc="".join(doc)[:a.chars]
 marker=f"ZEBRA-{a.seed:04d}-{random.Random(a.seed*7).randint(1000,9999)}"
 doc=doc[:len(doc)//2]+f"\n# The secret marker is {marker}.\n"+doc[len(doc)//2:]
 msgs=[{"role":"user","content":doc+"\n\nAnswer in one line: what is the secret marker written in the middle of the document above?"}]
-body=json.dumps({"model":a.model,"messages":msgs,"max_tokens":a.max_tokens,"temperature":0,"stream":True}).encode()
-t0=time.time(); first=None; out=[]
+# include_usage: the final chunk carries prompt_tokens_details.cached_tokens — direct evidence that the decoder hit the
+# bridged prefix, independent of any timing (2026-09-14: timings alone once hid a front door that buffered the stream)
+body=json.dumps({"model":a.model,"messages":msgs,"max_tokens":a.max_tokens,"temperature":0,"stream":True,"stream_options":{"include_usage":True}}).encode()
+t0=time.time(); first=None; first_content=None; out=[]; usage=None
 bridge=None
 with urllib.request.urlopen(urllib.request.Request(a.url+"/v1/chat/completions",body,{"Content-Type":"application/json"}),timeout=3600) as r:
     # record the front door's verdict so a native fallback can NEVER enter a results table as "bridged"
@@ -32,9 +34,16 @@ with urllib.request.urlopen(urllib.request.Request(a.url+"/v1/chat/completions",
         if not line.startswith(b"data: ") or line.strip()==b"data: [DONE]": continue
         try: d=json.loads(line[6:])
         except Exception: continue
-        c=d.get("choices",[{}])[0].get("delta",{}).get("content")
+        if d.get("usage"): usage=d["usage"]
+        choices=d.get("choices") or []          # the usage chunk has an empty choices list
+        delta=choices[0].get("delta",{}) if choices else {}
+        c=delta.get("content"); rc=delta.get("reasoning_content") or delta.get("reasoning")
+        if (c or rc) and first is None: first=time.time()-t0   # first token of any kind = the decoder's TTFT
         if c:
-            if first is None: first=time.time()-t0
+            if first_content is None: first_content=time.time()-t0
             out.append(c)
 tot=time.time()-t0; ans="".join(out).strip()
-print(json.dumps({"url":a.url,"seed":a.seed,"chars":len(doc),"ttft_s":round(first or -1,2),"total_s":round(tot,2),"marker":marker,"found":marker in ans,"answer":ans[:120],"bridge":bridge}))
+ptd=(usage or {}).get("prompt_tokens_details") or {}
+print(json.dumps({"url":a.url,"seed":a.seed,"chars":len(doc),"ttft_s":round(first or -1,2),"ttft_content_s":round(first_content or -1,2),"total_s":round(tot,2),
+                  "prompt_tokens":(usage or {}).get("prompt_tokens"),"cached_tokens":ptd.get("cached_tokens"),"completion_tokens":(usage or {}).get("completion_tokens"),
+                  "marker":marker,"found":marker in ans,"answer":ans[:120],"bridge":bridge}))
