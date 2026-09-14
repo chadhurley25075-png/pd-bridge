@@ -31,12 +31,24 @@ PD_SPARK_MODEL=os.environ.get("PD_SPARK_MODEL","deepseek-v4-flash")   # served m
 PD_SHARE_PORT=int(os.environ.get("PD_SHARE_PORT","8010"))               # capture share on the prefill head
 PD_BLOCK=int(os.environ.get("PD_BLOCK","256" if PD_MODE=="kv" else "2048"))   # decoder's paged_cache_block_size
 PD_TRANSPORT=os.environ.get("PD_TRANSPORT","tcp10")                       # recorded in every verdict: a number without its transport is not a number
+PD_STREAM=os.environ.get("PD_STREAM","0")=="1"                             # pooled mode: consume seg_<b> files WHILE the Spark prefills (docs/STREAMING-CAPTURE.md); the hook must run with PD_STREAM=1 too
+PD_STREAM_ACK=os.environ.get("PD_STREAM_ACK","0")=="1"                     # tell the share each segment is stored (with PD_SHARE_ACK_DELETE=1 there it frees the Spark's disk)
 # 9/6 (FINDING-bench4-cold-fallback.md): capture-trust knobs. The hook can flush MID-REQUEST during
 # chunked prefill (DONE + manifest T < request T) and a T-correct capture can still miss tail-boundary
 # data. The front validates every DONE capture, prefers a complete one, salvages the best contiguous
 # prefix, or declines LOUDLY — a native fallback can never again masquerade as a bridged measurement.
 PD_CAPTURE_GRACE=float(os.environ.get("PD_CAPTURE_GRACE","45"))    # after engine returns: wait this long for the final capture flush
-PD_STAMP_TIMEOUT=float(os.environ.get("PD_STAMP_TIMEOUT","300"))   # no capture stamp at all by here (engine still running) = share/hook dead
+PD_STAMP_TIMEOUT=float(os.environ.get("PD_STAMP_TIMEOUT","300"))   # FLOOR only — see stamp_deadline()
+# 9/7: a flat 300s silently broke every request above ~375K tokens. The prefill itself takes T/rate seconds, so a
+# fixed deadline is not "the share is dead", it is "the prompt is big". Measured bridged prefill ~1250 tok/s; 700 is
+# a deliberately pessimistic floor so a slow-but-healthy run is never mistaken for a dead hook. 900K -> ~1586s.
+PD_STAMP_TOK_RATE=float(os.environ.get("PD_STAMP_TOK_RATE","700"))
+# 9/7: the engine call, the capture fetch and the block push all carried a flat 900s. At 1.25M tokens the prefill
+# alone needs ~1400s, so the bridge died at 15 min and every request above ~800K silently fell back to the decoder
+# alone. One knob, generous, env-overridable. This is a ceiling for a hang, not a pacing budget.
+PD_LONG_TIMEOUT=float(os.environ.get("PD_LONG_TIMEOUT","10800"))
+def stamp_deadline(T):
+    return PD_STAMP_TIMEOUT + (T/PD_STAMP_TOK_RATE if T else 0.0)
 PD_MIN_COVERAGE=float(os.environ.get("PD_MIN_COVERAGE","0.5"))     # salvage floor: contiguous captured prefix / request tokens
 import shutil
 PD_PORT=int(os.environ.get("PD_PORT","8012"))
@@ -127,7 +139,7 @@ def spark_prefill(ids):
     base=PD_SPARK.rsplit(":",1)[0]+f":{PD_SHARE_PORT}"
     before=set(_http_listing(base))
     body=json.dumps({"model":PD_SPARK_MODEL,"prompt":ids,"max_tokens":1,"temperature":0}).encode()
-    t=time.time(); r=urllib.request.urlopen(urllib.request.Request(PD_SPARK+"/v1/completions",body,{"Content-Type":"application/json"}),timeout=900); r.read()
+    t=time.time(); r=urllib.request.urlopen(urllib.request.Request(PD_SPARK+"/v1/completions",body,{"Content-Type":"application/json"}),timeout=PD_LONG_TIMEOUT); r.read()
     t_engine=time.time()-t
     # wait for the sidecar whose token count matches (capture flushes on idle after the engine returns)
     name=None
@@ -144,7 +156,7 @@ def spark_prefill(ids):
     t_prefill=time.time()-t; L(f"bridge: engine {t_engine:.1f}s, capture ready +{t_prefill-t_engine:.1f}s")
     fname=name[:-5]+".safetensors"
     t=time.time(); local=os.path.join(LOCAL_CAP,fname)
-    with urllib.request.urlopen(base+"/"+fname,timeout=900) as rr, open(local,"wb") as f:
+    with urllib.request.urlopen(base+"/"+fname,timeout=PD_LONG_TIMEOUT) as rr, open(local,"wb") as f:
         while True:
             b=rr.read(1<<24)
             if not b: break
@@ -191,7 +203,7 @@ def _ls(base, sub=""):
 def _fetch_range(base, path, start, end):
     """bytes [start, end) via HTTP Range."""
     rq=urllib.request.Request(f"{base}/{path}", headers={"Range": f"bytes={start}-{end-1}"})
-    with urllib.request.urlopen(rq, timeout=900) as r:
+    with urllib.request.urlopen(rq, timeout=PD_LONG_TIMEOUT) as r:
         out=bytearray()
         while True:
             b=r.read(1<<24)
@@ -211,7 +223,7 @@ def spark_prefill_pipelined(ids, chunk=2048):
     def _engine():
         body=json.dumps({"model":PD_SPARK_MODEL,"prompt":ids,"max_tokens":1,"temperature":0}).encode()
         try:
-            r=urllib.request.urlopen(urllib.request.Request(PD_SPARK+"/v1/completions",body,{"Content-Type":"application/json"}),timeout=900); r.read(); eng["t"]=time.time()-tm["t0"]
+            r=urllib.request.urlopen(urllib.request.Request(PD_SPARK+"/v1/completions",body,{"Content-Type":"application/json"}),timeout=PD_LONG_TIMEOUT); r.read(); eng["t"]=time.time()-tm["t0"]
         except Exception as e: eng["err"]=repr(e)
     th=threading.Thread(target=_engine,daemon=True); th.start()
     stamp=None
@@ -274,11 +286,11 @@ def spark_prefill_pooled(ids):
     from pd_assemble_blocks import assemble_and_write
     base=PD_SPARK.rsplit(":",1)[0]+f":{PD_SHARE_PORT}"; T=len(ids)
     before={e["name"] for e in _ls(base) if e["dir"]}
-    tm={"t0":time.time()}; eng={}
+    tm={"t0":time.time(),"transport":PD_TRANSPORT}; eng={}
     def _engine():
         body=json.dumps({"model":PD_SPARK_MODEL,"prompt":ids,"max_tokens":1,"temperature":0}).encode()
         try:
-            r=urllib.request.urlopen(urllib.request.Request(PD_SPARK+"/v1/completions",body,{"Content-Type":"application/json"}),timeout=900); r.read(); eng["t"]=time.time()-tm["t0"]
+            r=urllib.request.urlopen(urllib.request.Request(PD_SPARK+"/v1/completions",body,{"Content-Type":"application/json"}),timeout=PD_LONG_TIMEOUT); r.read(); eng["t"]=time.time()-tm["t0"]
         except Exception as e: eng["err"]=repr(e)
     th=threading.Thread(target=_engine,daemon=True); th.start()
     scanned={}; chosen=None; t_eng_done=None
@@ -313,8 +325,8 @@ def spark_prefill_pooled(ids):
                 except Exception as e:
                     L(f"bridge: /_flush signal failed ({e!r}) — hook idle/new-request backstops apply")
             elif time.time()-t_eng_done>PD_CAPTURE_GRACE: break
-        elif time.time()-tm["t0"]>PD_STAMP_TIMEOUT:
-            raise RuntimeError(f"no complete capture {PD_STAMP_TIMEOUT:.0f}s after request start while the engine still runs — capture share down or hook dead?")
+        elif time.time()-tm["t0"]>stamp_deadline(T):
+            raise RuntimeError(f"no complete capture {stamp_deadline(T):.0f}s after request start (T={T}, floor {PD_STAMP_TIMEOUT:.0f}s + T/{PD_STAMP_TOK_RATE:.0f}) while the engine still runs — capture share down or hook dead?")
         time.sleep(0.2)
     verdict="complete"; stamp=chosen
     if stamp is None:
@@ -325,10 +337,16 @@ def spark_prefill_pooled(ids):
             raise RuntimeError(f"bridge declined: no usable capture for T={T} after engine completion + {PD_CAPTURE_GRACE:.0f}s grace. Candidates — {detail}. Likely the hook's mid-request idle flush during chunked prefill (FINDING-bench4-cold-fallback.md root cause A).")
         stamp=best_s; verdict=f"salvage {best_up}/{T}"; tm["t_done_seen"]=round(time.time()-tm["t0"],2)
         L(f"bridge: no complete capture; salvaging {stamp} (usable prefix {best_up}/{T} = {best_up/T:.0%})")
+    return _pull_and_assemble(base, stamp, ids, tm, eng, th, verdict)
+
+def _pull_and_assemble(base, stamp, ids, tm, eng, th, verdict):
+    """Pull a DONE pooled capture's layer files and assemble every boundary (the one-shot path)."""
+    from pd_assemble_blocks import assemble_and_write
+    T=len(ids)
     local=os.path.join(PD_PULL_DIR, stamp); os.makedirs(local, exist_ok=True); pulled=0
     for e in _ls(base, stamp):
-        if e["dir"] or e["name"]=="DONE": continue
-        with urllib.request.urlopen(f"{base}/{stamp}/{e['name']}", timeout=600) as r, open(os.path.join(local,e["name"]),"wb") as f:
+        if e["dir"] or e["name"]=="DONE" or e["name"].startswith("seg_"): continue
+        with urllib.request.urlopen(f"{base}/{stamp}/{e['name']}", timeout=PD_LONG_TIMEOUT) as r, open(os.path.join(local,e["name"]),"wb") as f:
             while True:
                 b=r.read(1<<24)
                 if not b: break
@@ -342,12 +360,136 @@ def spark_prefill_pooled(ids):
     cov=ainfo["coverage"]
     if not paths or cov<PD_MIN_COVERAGE:
         raise RuntimeError(f"bridge declined: assembled {ainfo['B']}/{T} tokens ({cov:.0%}) < {PD_MIN_COVERAGE:.0%} minimum — capture incomplete (missing_at={ainfo.get('missing_at')})")
-    full_B=(T//2048)*2048          # B<full_B means genuinely missing boundaries; B==full_B with a sub-boundary tail is the NORMAL complete case (oMLX prefills the tail natively by design)
+    full_B=(T//PD_BLOCK)*PD_BLOCK  # B<full_B means genuinely missing boundaries; B==full_B with a sub-boundary tail is the NORMAL complete case (oMLX prefills the tail natively by design)
     if ainfo["B"]<full_B: verdict=f"partial {ainfo['B']}/{T}"
     tm["verdict"]=verdict
     try: shutil.rmtree(local)
     except Exception: pass
     return paths, tm
+
+def spark_prefill_stream(ids):
+    """PD_STREAM=1 (docs/STREAMING-CAPTURE.md): the hook ships seg_<b>.safetensors for every finished 2048-token
+    boundary WHILE the prefill runs; we pull each one the moment it is listed, build that boundary's decoder state
+    and store its block through oMLX's own writer — so the Spark never holds more than one chunk of capture and the
+    block assembly overlaps the prefill instead of following it. manifest.json + DONE still arrive last; the manifest's
+    `stream.segments` must match what we consumed (check_manifest) or the verdict says so. If the capture that appears
+    is NOT a streaming one (hook launched without PD_STREAM=1) this falls back to the one-shot pull+assemble."""
+    from pd_assemble_blocks import StreamAssembler
+    from pd_stream_assembler import ready_segments, seg_name
+    base=PD_SPARK.rsplit(":",1)[0]+f":{PD_SHARE_PORT}"; T=len(ids)
+    before={e["name"] for e in _ls(base) if e["dir"]}
+    tm={"t0":time.time(),"transport":PD_TRANSPORT,"stream":True}; eng={}
+    def _engine():
+        body=json.dumps({"model":PD_SPARK_MODEL,"prompt":ids,"max_tokens":1,"temperature":0}).encode()
+        try:
+            r=urllib.request.urlopen(urllib.request.Request(PD_SPARK+"/v1/completions",body,{"Content-Type":"application/json"}),timeout=PD_LONG_TIMEOUT); r.read(); eng["t"]=time.time()-tm["t0"]
+        except Exception as e: eng["err"]=repr(e)
+    th=threading.Thread(target=_engine,daemon=True); th.start()
+    # the capture dir appears with the first ingested chunk; its start manifest says whether the hook streams
+    stamp=None; streaming=None
+    while stamp is None:
+        if "err" in eng: raise RuntimeError("spark engine: "+eng["err"])
+        try: new=sorted(e["name"] for e in _ls(base) if e["dir"] and e["name"] not in before)
+        except Exception as e: new=[]; L(f"bridge: capture share unreachable ({e!r}) — retrying")
+        for cand in reversed(new):
+            try: man0=_cap_manifest(base, cand)
+            except Exception: continue
+            stamp=cand; streaming=bool(man0.get("stream")); tm["stamp_seen"]=round(time.time()-tm["t0"],2); break
+        if stamp is None:
+            if time.time()-tm["t0"]>stamp_deadline(T):
+                raise RuntimeError(f"no capture directory {stamp_deadline(T):.0f}s after request start (T={T}) while the engine still runs — capture share down or hook dead?")
+            time.sleep(0.2)
+    L(f"bridge(stream): capture {stamp} appeared +{tm['stamp_seen']}s, hook streaming={streaming}")
+    if not streaming:
+        L("bridge(stream): the hook is not in PD_STREAM mode — falling back to the one-shot pooled path for this request")
+        tm["stream"]=False
+        return _wait_done_then_pull(base, stamp, ids, tm, eng, th)
+    local=os.path.join(PD_PULL_DIR, stamp); os.makedirs(local, exist_ok=True); pulled=0
+    asm=StreamAssembler(ids, MODEL, PD_MODEL_NAME, PD_CACHE_DIR, block=PD_BLOCK)
+    man=None; t_eng_done=None; last_log=0
+    while True:
+        try: names=[e["name"] for e in _ls(base, stamp) if not e["dir"]]
+        except Exception as e: names=[]; L(f"bridge(stream): share listing failed ({e!r}) — retrying")
+        prog=False
+        for b,name in ready_segments(names, asm.next_b(), PD_BLOCK):
+            if b>T or asm.stopped: break
+            dst=os.path.join(local,name); t1=time.time()
+            with urllib.request.urlopen(f"{base}/{stamp}/{name}", timeout=PD_LONG_TIMEOUT) as r, open(dst+".tmp","wb") as f:
+                while True:
+                    chunk=r.read(1<<24)
+                    if not chunk: break
+                    f.write(chunk); pulled+=len(chunk)
+            os.replace(dst+".tmp", dst)
+            if "t_first_segment" not in tm: tm["t_first_segment"]=round(time.time()-tm["t0"],2)
+            t2=time.time(); stored=asm.on_segment(b, dst); t3=time.time()
+            tm["t_pull_s"]=round(tm.get("t_pull_s",0)+(t2-t1),3); tm["t_store_s"]=round(tm.get("t_store_s",0)+(t3-t2),3)
+            try: os.unlink(dst)                       # the block is in the oMLX cache; the segment stays on the Spark until acked/pruned
+            except Exception: pass
+            if stored and PD_STREAM_ACK:
+                try: urllib.request.urlopen(f"{base}/_ack/{stamp}/{name}", timeout=5).read()
+                except Exception as e: L(f"bridge(stream): ack {name} failed ({e!r})")
+            prog=True
+            if time.time()-last_log>15: last_log=time.time(); L(f"bridge(stream): boundary {b}/{T} stored (+{time.time()-tm['t0']:.1f}s, pull {tm['t_pull_s']}s, store {tm['t_store_s']}s)")
+        if man is None and "DONE" in names and "manifest.json" in names:
+            man=_cap_manifest(base, stamp); tm["t_done_seen"]=round(time.time()-tm["t0"],2)
+            st=man.get("stream") or {}
+            for k in ("segments","emitted_T","segment_bytes","segment_write_s","error"):
+                if k in st: tm["spark_stream_"+k]=(len(st[k]) if k=="segments" else st[k])
+            tm["spark_T"]=man.get("T"); tm["spark_flush_reason"]=man.get("flush_reason")
+        if man is not None:
+            pending=[b for b in ((man.get("stream") or {}).get("segments") or []) if b not in asm.consumed() and b<=T and not asm.stopped]
+            if not pending: break
+            if not prog and seg_name(pending[0]) not in names: break        # sealed, listed, gone from the share: report it
+        if "err" in eng: raise RuntimeError("spark engine: "+eng["err"])
+        if eng.get("t") is not None and t_eng_done is None:
+            t_eng_done=time.time(); tm["t_engine"]=round(eng["t"],2)
+            L(f"bridge(stream): engine done +{eng['t']:.1f}s; signaling FLUSH_NOW; {asm.ok} boundaries already stored")
+            try: urllib.request.urlopen(base+"/_flush", timeout=5).read(); tm["t_flush_signal"]=round(time.time()-tm["t0"],2)
+            except Exception as e: L(f"bridge(stream): /_flush signal failed ({e!r}) — hook idle/new-request backstops apply")
+        if man is None and t_eng_done is not None and time.time()-t_eng_done>PD_CAPTURE_GRACE:
+            L(f"bridge(stream): no DONE {PD_CAPTURE_GRACE:.0f}s after the engine returned — salvaging the {asm.ok} boundaries already stored"); break
+        if not prog: time.sleep(0.2)
+    tm["pulled_gb"]=round(pulled/1e9,3)
+    paths,ainfo=asm.finalize(man)
+    th.join(timeout=60)
+    if "t_engine" not in tm and eng.get("t") is not None: tm["t_engine"]=round(eng["t"],2)
+    tm.update({"t_assembled":round(time.time()-tm["t0"],2),"boundaries_ok":ainfo["boundaries_ok"],"B":ainfo["B"],"coverage":ainfo["coverage"],
+               "segments_consumed":ainfo.get("segments_consumed")})
+    for k in ("missing_at","stream_check"):
+        if k in ainfo: tm[k]=ainfo[k]
+    try: shutil.rmtree(local)
+    except Exception: pass
+    cov=ainfo["coverage"]
+    if not paths or cov<PD_MIN_COVERAGE:
+        raise RuntimeError(f"bridge declined: streamed {ainfo['B']}/{T} tokens ({cov:.0%}) < {PD_MIN_COVERAGE:.0%} minimum (manifest={'sealed' if man else 'never arrived'}, missing_at={ainfo.get('missing_at')}, stream_error={(man or {}).get('stream',{}).get('error')})")
+    full_B=(T//PD_BLOCK)*PD_BLOCK
+    if man is None: verdict=f"salvage {ainfo['B']}/{T}"
+    elif ainfo["B"]<full_B: verdict=f"partial {ainfo['B']}/{T}"
+    else: verdict="complete"
+    tm["verdict"]=verdict
+    return paths, tm
+
+def _wait_done_then_pull(base, stamp, ids, tm, eng, th):
+    """Streaming front, non-streaming hook: wait for this stamp's DONE (FLUSH_NOW when the engine returns, grace,
+    salvage rules as in spark_prefill_pooled) then run the one-shot pull+assemble."""
+    T=len(ids); t_eng_done=None; man=None
+    while True:
+        try: names={e["name"] for e in _ls(base, stamp)}
+        except Exception: names=set()
+        if "DONE" in names and "manifest.json" in names:
+            man=_cap_manifest(base, stamp); tm["t_done_seen"]=round(time.time()-tm["t0"],2); break
+        if "err" in eng: raise RuntimeError("spark engine: "+eng["err"])
+        if eng.get("t") is not None and t_eng_done is None:
+            t_eng_done=time.time(); tm["t_engine"]=round(eng["t"],2)
+            try: urllib.request.urlopen(base+"/_flush", timeout=5).read(); tm["t_flush_signal"]=round(time.time()-tm["t0"],2)
+            except Exception as e: L(f"bridge: /_flush signal failed ({e!r})")
+        if t_eng_done is not None and time.time()-t_eng_done>PD_CAPTURE_GRACE:
+            raise RuntimeError(f"bridge declined: engine returned {PD_CAPTURE_GRACE:.0f}s ago and capture {stamp} never sealed")
+        time.sleep(0.2)
+    up=_cap_usable_prefix(man)
+    if up<PD_MIN_COVERAGE*T:
+        raise RuntimeError(f"bridge declined: capture {stamp} usable prefix {up}/{T} (flush={man.get('flush_reason')})")
+    return _pull_and_assemble(base, stamp, ids, tm, eng, th, "complete" if up==T else f"salvage {up}/{T}")
 
 _RDMA=None
 class _RdmaClient:
@@ -391,7 +533,7 @@ def spark_prefill_kv(ids):
     def _engine():
         body=json.dumps({"model":PD_SPARK_MODEL,"prompt":ids,"max_tokens":1,"temperature":0,"kv_transfer_params":{"pd_tag":tag}}).encode()
         try:
-            r=urllib.request.urlopen(urllib.request.Request(PD_SPARK+"/v1/completions",body,{"Content-Type":"application/json"}),timeout=3600); r.read(); eng["t"]=time.time()-tm["t0"]
+            r=urllib.request.urlopen(urllib.request.Request(PD_SPARK+"/v1/completions",body,{"Content-Type":"application/json"}),timeout=PD_LONG_TIMEOUT); r.read(); eng["t"]=time.time()-tm["t0"]
         except Exception as e: eng["err"]=repr(e)
     th=threading.Thread(target=_engine,daemon=True); th.start()
     polls=0; t_eng_done=None; man=None
@@ -474,7 +616,7 @@ def spark_prefill_kv_stream(ids):
     def _engine():
         body=json.dumps({"model":PD_SPARK_MODEL,"prompt":ids,"max_tokens":1,"temperature":0,"kv_transfer_params":params}).encode()
         try:
-            r=urllib.request.urlopen(urllib.request.Request(PD_SPARK+"/v1/completions",body,{"Content-Type":"application/json"}),timeout=3600); r.read(); eng["t"]=time.time()-tm["t0"]
+            r=urllib.request.urlopen(urllib.request.Request(PD_SPARK+"/v1/completions",body,{"Content-Type":"application/json"}),timeout=PD_LONG_TIMEOUT); r.read(); eng["t"]=time.time()-tm["t0"]
         except Exception as e: eng["err"]=repr(e)
     th=threading.Thread(target=_engine,daemon=True); th.start()
     t_eng_done=None
@@ -547,8 +689,9 @@ def bridge(raw_json):
                 if tail<PD_MIN_TAIL: return {"skipped":True,"tokens":len(ids),"cached_prefix":cached,"tail":tail,"why":f"warm — new tail {tail} < {PD_MIN_TAIL}, oMLX prefills it natively"}
             elif cached>0: return {"skipped":True,"tokens":len(ids),"cached_prefix":cached,"tail":tail,"why":"warm — oMLX prefills only the tail natively (hidden-state mode bridges cold prompts only)"}
         if PD_MODE=="pooled":
-            paths,tm=spark_prefill_pooled(ids)
-            L(f"bridge(pooled): engine {tm.get('t_engine')}s, DONE +{tm.get('t_done_seen')}s, pulled {tm.get('pulled_gb')} GB by +{tm.get('t_assembled')}s, blocks {len(paths)}, verdict {tm.get('verdict')}")
+            paths,tm=(spark_prefill_stream if PD_STREAM else spark_prefill_pooled)(ids)   # PD_STREAM=1: blocks land while the Spark prefills
+            L(f"bridge(pooled{'/stream' if tm.get('stream') else ''}): engine {tm.get('t_engine')}s, DONE +{tm.get('t_done_seen')}s, "
+              f"{'first segment +'+str(tm.get('t_first_segment'))+'s, ' if tm.get('stream') else ''}pulled {tm.get('pulled_gb')} GB by +{tm.get('t_assembled')}s, blocks {len(paths)}, verdict {tm.get('verdict')} via {tm.get('transport')}")
             return {"skipped":False,"mode":"pooled","tokens":len(ids),"t_tokenize":round(t_tok,2),**{k:v for k,v in tm.items() if k!="t0"},"blocks":len(paths)}
         cache,w,tm=spark_prefill_pipelined(ids)
         L(f"bridge: engine {tm['t_engine']}s, first bytes +{tm['t_first_bytes']}s, rebuild done +{tm['t_rebuild_done']}s, pulled {tm['pulled_gb']} GB")
@@ -579,7 +722,7 @@ class H(BaseHTTPRequestHandler):
             info["t_bridge_total"]=round(time.time()-t,2)
         # forward to oMLX (streaming passthrough)
         t=time.time(); rq=urllib.request.Request(PD_OMLX+self.path,raw,{"Content-Type":"application/json"})
-        try: r=urllib.request.urlopen(rq,timeout=3600)
+        try: r=urllib.request.urlopen(rq,timeout=PD_LONG_TIMEOUT)
         except urllib.error.HTTPError as e: r=e
         self.send_response(r.status)
         self.send_header("Content-Type", r.headers.get("Content-Type","application/json")); self.send_header("Connection","close")
@@ -605,7 +748,7 @@ class H(BaseHTTPRequestHandler):
 # step serializes, which is the part that must.
 _BRIDGE_Q: "_queue.Queue[tuple]" = _queue.Queue()
 
-def bridge_via_main(req, timeout=3600):
+def bridge_via_main(req, timeout=PD_LONG_TIMEOUT):
     """Called from a handler thread: run bridge(req) on the main thread, return its result or raise."""
     done = threading.Event(); box = {}
     _BRIDGE_Q.put((req, box, done))

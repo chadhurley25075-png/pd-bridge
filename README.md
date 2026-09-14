@@ -121,6 +121,11 @@ were alive at once. At 1,021,199 tokens it died after 11 of 43 layers and drove 
 thrash — no sshd even over a 200G fabric. It needed a physical power button. The hook now releases
 each layer as its file lands and checks `MemAvailable` every 64 layer-chunks.
 
+**Streaming capture (`PD_STREAM=1`, branch `stream-capture`, not yet run on a live pair) removes this floor by
+shipping each finished 2048-token boundary during the prefill and releasing it, so the box holds one chunk instead
+of the prompt — design, wire format and failure modes in [docs/STREAMING-CAPTURE.md](docs/STREAMING-CAPTURE.md),
+deploy/rollback in [DEPLOY-STAGED.md](DEPLOY-STAGED.md).
+
 **If you are memory-tight, this is your limit, not the window.** The window is a config number; the
 floor is physics on your box. Measure `MemAvailable` during a long prefill before trusting either.
 

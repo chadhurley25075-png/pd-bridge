@@ -56,8 +56,14 @@ try: cap._worker()
 except Stop: pass
 check(f"G worker passes reason to _finish: {seen}", seen.get("reason") == "flush_now")
 
+# The "ORIGINAL" demonstration needs the PRE-FIX hook (2026-09-06, lab copy) — point PD_ORIG_HOOK at it to see
+# the bug reproduce. The repo carries only the fixed hook, so without it this section is skipped, not failed.
+_orig = os.environ.get("PD_ORIG_HOOK")
+if not _orig or not os.path.isfile(_orig):
+    print("SKIP ORIGINAL scenario (set PD_ORIG_HOOK=/path/to/pre-fix/capture_sitecustomize_v3.py to run it)")
+    print("ALL PASS" if ok else "SOME FAILED"); sys.exit(0 if ok else 1)
 print("== ORIGINAL (lab canonical) — one tick of _watch in a process with NO open request ==")
-O = load("./capture_sitecustomize_v3.py", "hook_orig")
+O = load(_orig, "hook_orig")
 root2 = tempfile.mkdtemp(); flag2 = os.path.join(root2, "FLUSH_NOW"); touch(flag2)
 cap = O._Capture(root=root2, idle_s=15.0, weights=object(), start_threads=False)   # req is None, like pid 1 / pid 89
 n = {"calls": 0}

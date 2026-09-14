@@ -10,7 +10,7 @@ NATIVE   ?= http://127.0.0.1:8011
 
 help:
 	@echo "make doctor      — check every link in the chain (run this first, always)"
-	@echo "make test        — CPU-only tests, run anywhere (CI tier): hook selftest + scrub check"
+	@echo "make test        — CPU-only tests, run anywhere (CI tier): hook selftest + flush watcher + streaming capture/assembler + scrub check"
 	@echo "make test-mac    — Mac-side tests (needs the oMLX venv + model; synthetic writer vs reference block)"
 	@echo "make test-spark  — in-container smoke test (needs the running vllm_pd container + weights)"
 	@echo "make weights     — regenerate dv4_proj_weights.safetensors from YOUR MLX model (never downloaded)"
@@ -22,6 +22,9 @@ doctor: ; @bash scripts/hetero-doctor.sh
 
 test:
 	$(PY_SPARK) spark/pd_pool_selftest.py --T 5000
+	$(PY_SPARK) spark/test_flush_decision.py
+	$(PY_SPARK) spark/test_stream_capture.py
+	$(PY_MAC) studio/test_stream_assembler.py
 	bash scripts/scrub-check.sh
 
 test-mac:

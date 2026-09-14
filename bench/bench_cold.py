@@ -44,6 +44,17 @@ with urllib.request.urlopen(urllib.request.Request(a.url+"/v1/chat/completions",
             out.append(c)
 tot=time.time()-t0; ans="".join(out).strip()
 ptd=(usage or {}).get("prompt_tokens_details") or {}
+# THE THREE FIELDS EVERY ROW MUST CARRY (bench/BENCHMARK-PROTOCOL.md): verdict — the front door's own word for what
+# happened (complete / partial B/T / salvage / skipped / declined / native); transport — the wire the capture crossed
+# (tcp10, rdma2, rdma4, or none); cached_tokens — the decoder's own count of prompt tokens it served from cache. A row
+# with a fast time and no verdict, or a verdict but cached_tokens ~0, did not measure the bridge.
+b=bridge if isinstance(bridge,dict) else {}
+if not bridge: verdict="native"                       # no X-PD-Bridge header at all: this endpoint is the decoder itself
+elif b.get("bridge_error"): verdict="declined: "+str(b.get("bridge_error"))[:80]
+elif b.get("skipped"): verdict="skipped: "+str(b.get("why",""))[:60]
+else: verdict=b.get("verdict") or "bridged (no verdict field — old front door?)"
+transport=b.get("transport") or ("none" if not bridge or b.get("skipped") or b.get("bridge_error") else "unknown")
 print(json.dumps({"url":a.url,"seed":a.seed,"chars":len(doc),"ttft_s":round(first or -1,2),"ttft_content_s":round(first_content or -1,2),"total_s":round(tot,2),
                   "prompt_tokens":(usage or {}).get("prompt_tokens"),"cached_tokens":ptd.get("cached_tokens"),"completion_tokens":(usage or {}).get("completion_tokens"),
+                  "verdict":verdict,"transport":transport,"stream":bool(b.get("stream")),
                   "marker":marker,"found":marker in ans,"answer":ans[:120],"bridge":bridge}))
