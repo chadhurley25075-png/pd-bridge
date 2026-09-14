@@ -213,6 +213,16 @@ studio/   decode side (Apple Silicon / oMLX)
   verify_blocks.py              directory-vs-directory block comparison
   pd_diff_state.py              cache-array diff against a full forward
   test_block_writer_synthetic.py
+  pd_omlx_hooks.py              kv/RDMA path: staged restore, tail install, restore timing (PD_OMLX_HOOKS=1)
+  pd-front-kv.sh / pd-rdma-recvd.sh   front door in kv mode / the RDMA receiver
+  pd_assemble_kv.py, pd_verify_kv.py, test_omlx_block.py   kv-path assembly, bridged-vs-native check, block header gate
+
+spark/ (kv/RDMA path)
+  pd_kv_connector.py            vLLM v1 KV connector: oMLX-native blocks built on the GPU, pushed over RDMA during prefill
+  pd_omlx_block.py              oMLX chain hashes + block file header
+  pd-launch-kv.sh, pd_memguard.sh, pd-rdma-serve.sh, test_kv_gather.py
+
+rdma/     pd_rdma (receiver, R1 pull server/client) + libpd_rdma_tx.so (the connector's sender); docs/RDMA.md
 
 bench/    bench_cold.py (records the X-PD-Bridge verdict), hetero (the one-command demo client),
           BENCHMARK-PROTOCOL.md
@@ -326,6 +336,15 @@ Point any OpenAI-compatible client at `:8012`. Prompts under `PD_MIN_TOKENS` or 
 python3 bench/bench_cold.py --chars 330000 --seed 301 --url http://<decoder>:8012   # bridged
 python3 bench/bench_cold.py --chars 330000 --seed 302 --url http://<decoder>:8011   # native
 ```
+
+### Plain-attention models over RDMA
+
+A dense GQA model (Qwen3, Llama, Mistral, …) needs no pooling port: its decoder cache is the prefill engine's own
+K/V rows. `PD_MODE=kv` uses an official vLLM KV connector to cut those rows into oMLX-native block files on the GPU,
+pushes them over RoCEv2 while the prefill runs, and hands oMLX a staged cache plus the tail rows, so the decoder
+prefills one token. Reference: Qwen3-32B bf16, one DGX Spark → Mac Studio M2 Ultra (Mac NIC via
+[MelonDMA](https://github.com/denmrnngp-cloud/MelonDMA)) — TTFT 43.9 s at 33K tokens with the engine at 42.6 s,
+~4.4× the native oMLX rate measured at ~32K. Setup, porting checklist and verification: **[docs/RDMA.md](docs/RDMA.md)**.
 
 ## Gotchas that cost us hours
 

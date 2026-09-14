@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Lets pd_rdma open the MelonDMA DEXT user client (same entitlement as MelonDMA's own tools). -->
+    <key>com.apple.developer.driverkit.userclient-access</key>
+    <array>
+        <string>com.melondma.rdma.dext</string>
+    </array>
+</dict>
+</plist>
