@@ -56,6 +56,13 @@ the bridge does, not a claimed speedup. The measured ratios stop at 241K and are
 
 Full numbers and methodology: [RESULTS.md](RESULTS.md) · [bench/BENCHMARK-PROTOCOL.md](bench/BENCHMARK-PROTOCOL.md)
 
+**2026-09-17 — the link is no longer plain 10GbE.** A Mac Studio joined the Sparks' RoCE fabric through a MikroTik switch
+(ConnectX-4 Lx in a Thunderbolt enclosure, driven by **[Ash Hart's MCDMA](https://github.com/ashhart/MCDMA)**), and a second
+Studio receives the same blocks over Apple's Thunderbolt RDMA. The cache now moves Spark → door Studio → library Studio → back
+as RDMA on every hop, and a four-turn conversation answered from the library in **7–10 s vs 30 s on one Studio and 18 s on the
+Sparks alone**. That layer, its tools and its numbers live in [`fabric/`](fabric/README.md). None of it exists without MCDMA;
+Ben's MelonDMA told us what the Gen3 tunnel would do before we had one.
+
 
 ---
 
