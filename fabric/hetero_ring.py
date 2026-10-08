@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """hetero_ring.py — the literal 4-machine loop, measured per hop, per turn.
    Turn k:  prompt_k = prior turns + new text
-     1. Sparks 6+7 prefill prompt_k (vLLM TP2)            -> capture on spark-a
+     1. Spark pair prefills prompt_k (vLLM TP2)            -> capture on rank 0
      2. capture -> S1 over MCDMA RDMA WRITE (rdma_pulldir)  -> S1 assembles oMLX blocks (pd_front bridge does 1+2)
      3. S1 decodes reply_k (oMLX, prefix hit)                [door decode]
      4. S1 blocks -> S2 over TB5 RDMA (tbsend UC SEND)       -> S2 holds the library; S2 decodes reply_k too [library decode]
      5. reply_k -> back into prompt_{k+1} -> Sparks prefill again (carry = text; KV-carry is the next build)
    Controls each turn: S2-alone (native oMLX, no Sparks), Spark-alone (vLLM generate).
-   Runs on the control host. Writes JSONL to ~/pd_lab/rdma/ring_results.jsonl"""
+   Runs on any box that can reach all three. Writes JSONL to ~/pd_lab/rdma/ring_results.jsonl
+   usage: hetero_ring.py [seed_file] [turns] [add_chars]   (env: RING_DOC = the long text the turns read from)"""
 import json,time,subprocess,sys,os,urllib.request
-S1="user@10.0.0.21"; S2="user@10.0.0.22"; S06="user@10.0.0.11"
-S1_FRONT="http://10.0.0.21:8012/v1/chat/completions"; S1_OMLX="http://10.0.0.21:8011/v1/chat/completions"; S2_OMLX="http://127.0.0.1:18014/v1/chat/completions"; SPARK="http://10.0.0.11:8000"
+E=os.environ.get
+S1=E("RING_S1_SSH","user@DOOR_STUDIO"); S2=E("RING_S2_SSH","user@LIBRARY_STUDIO")
+S1_FRONT=E("RING_S1_FRONT","http://DOOR_STUDIO:8012/v1/chat/completions"); S1_OMLX=E("RING_S1_OMLX","http://DOOR_STUDIO:8011/v1/chat/completions")
+S2_OMLX=E("RING_S2_OMLX","http://127.0.0.1:18014/v1/chat/completions"); SPARK=E("RING_SPARK","http://PREFILL_HEAD:8000")
 MODEL="DV4-Flash-MXFP4-MLX"; OUT=os.path.expanduser("~/pd_lab/rdma/ring_results.jsonl")
 def ssh(h,c,t=300): return subprocess.run(["ssh","-o","BatchMode=yes",h,c],capture_output=True,text=True,timeout=t)
 def post(url,body,t=900):
@@ -39,12 +42,12 @@ def spark_generate(prompt,max_tokens):
 if __name__=="__main__":
     seed=open(sys.argv[1]).read() if len(sys.argv)>1 and sys.argv[1] else ""
     turns=int(sys.argv[2]) if len(sys.argv)>2 else 3; add_chars=int(sys.argv[3]) if len(sys.argv)>3 else 60000
-    vol=open('/path/to/notes.txt',errors='replace').read(); cursor=int(len(vol)*0.5)
+    vol=open(os.environ["RING_DOC"],errors='replace').read(); cursor=int(len(vol)*0.5)   # any long text; ours was a private journal
     ssh(S1,'touch /tmp/.ring_marker')
     history=[]; convo_text=seed
     for k in range(1,turns+1):
         chunk=vol[cursor:cursor+add_chars]; cursor+=add_chars
-        q=f"[Turn {k}] Here is more of the scroll:\n\n{chunk}\n\nIn 2-3 sentences, what is the most important thing that happened in this passage, and how does it connect to the previous turns?"
+        q=f"[Turn {k}] Here is more of the document:\n\n{chunk}\n\nIn 2-3 sentences, what is the most important thing that happened in this passage, and how does it connect to the previous turns?"
         history.append({"role":"user","content":q}); rec={"turn":k,"prompt_chars":sum(len(m["content"]) for m in history)}
         # 1-3: hetero door (Sparks prefill -> RDMA -> S1 decode)
         h=chat(S1_FRONT,history,120); rec["hetero_s1"]={"wall":h["wall"],"usage":h["usage"],"bridge":h["bridge"],"text":h["text"][:200]}
