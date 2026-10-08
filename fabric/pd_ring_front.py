@@ -9,14 +9,14 @@ Every request circulates the ring:
      so S1's cache (the door) also holds the reply. The Sparks re-prefill from text on the next turn (KV return arrow = next build);
      the ring keeps the two Studios' caches identical so either can answer.
 Falls back to S1-only if S2 is unreachable. Every hop timed into the X-PD-Ring header and ~/pd_ring.log.
-Env: RING_S1_FRONT (http://127.0.0.1:8012), RING_S2_OMLX (http://127.0.0.1:18014), RING_S2_SSH (user@10.0.0.22),
+Env: RING_S1_FRONT (http://127.0.0.1:8012), RING_S2_OMLX (http://127.0.0.1:18014), RING_S2_SSH (user@LIBRARY_STUDIO),
      RING_S1_TBDEV (rdma_en4), RING_S2_TBDEV (rdma_en3), RING_S1_GID (2), RING_S2_GID (1), RING_PORT (8015)"""
 import json,os,sys,time,subprocess,threading,urllib.request,glob
 from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
 E=os.environ.get
-S1_FRONT=E("RING_S1_FRONT","http://127.0.0.1:8012"); S2_OMLX=E("RING_S2_OMLX","http://127.0.0.1:18014"); S2_SSH=E("RING_S2_SSH","user@10.0.0.22")
+S1_FRONT=E("RING_S1_FRONT","http://127.0.0.1:8012"); S2_OMLX=E("RING_S2_OMLX","http://127.0.0.1:18014"); S2_SSH=E("RING_S2_SSH","user@LIBRARY_STUDIO"); S1_SELF=E("RING_S1_SELF_SSH",os.environ.get("USER","user")+"@127.0.0.1")
 S1_TB=E("RING_S1_TBDEV","rdma_en4"); S2_TB=E("RING_S2_TBDEV","rdma_en3"); S1_GID=E("RING_S1_GID","2"); S2_GID=E("RING_S2_GID","1")
-CACHE=os.path.expanduser("~/.omlx/cache"); S2_CACHE="$HOME/.omlx/cache"; PORT=int(E("RING_PORT","8015"))
+CACHE=os.path.expanduser("~/.omlx/cache"); S2_CACHE=E("RING_S2_CACHE","~/.omlx/cache"); PORT=int(E("RING_PORT","8015"))   # S2_CACHE lives on the library Studio (expanded by its shell)
 LOG=open(os.path.expanduser("~/pd_ring.log"),"a"); LOCK=threading.Lock()
 def L(*a):
     with LOCK: LOG.write(time.strftime("%H:%M:%S ")+" ".join(str(x) for x in a)+"\n"); LOG.flush()
@@ -37,7 +37,7 @@ def ship_s1_to_s2(marker):
     if not files: return {"files":0}
     subprocess.run(["bash","-c",f'cd {CACHE} && find . -name "*.safetensors" -newer {marker} | tar -cf /tmp/ring_s1s2.tar -T -'],check=True)
     size=os.path.getsize("/tmp/ring_s1s2.tar"); t0=time.time()
-    m=tb_send("/tmp/ring_s1s2.tar","/tmp/ring_s1s2.tar","user@127.0.0.1",S1_TB,S1_GID,S2_SSH,S2_TB,S2_GID)
+    m=tb_send("/tmp/ring_s1s2.tar","/tmp/ring_s1s2.tar",S1_SELF,S1_TB,S1_GID,S2_SSH,S2_TB,S2_GID)
     ssh(S2_SSH,f"cd {S2_CACHE} && tar -xf /tmp/ring_s1s2.tar && rm -f /tmp/ring_s1s2.tar")
     return {"files":len(files),"bytes":size,"wire_s":float(m.get("seconds",0)),"gbit":float(m.get("gbit",0)),"total_s":round(time.time()-t0,2)}
 def ship_s2_to_s1(marker_iso):
@@ -46,7 +46,7 @@ def ship_s2_to_s1(marker_iso):
     parts=r.stdout.split(); n=int(parts[0]) if parts else 0
     if n==0: return {"files":0}
     size=int(parts[1]); t0=time.time()
-    m=tb_send("/tmp/ring_s2s1.tar","/tmp/ring_s2s1.tar",S2_SSH,S2_TB,S2_GID,"user@127.0.0.1",S1_TB,S1_GID)
+    m=tb_send("/tmp/ring_s2s1.tar","/tmp/ring_s2s1.tar",S2_SSH,S2_TB,S2_GID,S1_SELF,S1_TB,S1_GID)
     subprocess.run(["bash","-c",f"cd {CACHE} && tar -xf /tmp/ring_s2s1.tar && rm -f /tmp/ring_s2s1.tar"],check=True)
     return {"files":n,"bytes":size,"wire_s":float(m.get("seconds",0)),"gbit":float(m.get("gbit",0)),"total_s":round(time.time()-t0,2)}
 class H(BaseHTTPRequestHandler):

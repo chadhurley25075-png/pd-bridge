@@ -1,0 +1,10 @@
+--- a/mlx_lm/models/mla.py
++++ b/mlx_lm/models/mla.py
+@@ -17,6 +17,7 @@
+         )
+ 
+     def __call__(self, x, transpose=True):
++        x = mx.contiguous(x)  # flashpp: MLX-CUDA (GB10) mis-computes bmm on strided activation views
+         if transpose:
+             return x @ self.weight.swapaxes(-1, -2)
+         else:

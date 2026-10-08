@@ -63,6 +63,26 @@ as RDMA on every hop, and a four-turn conversation answered from the library in 
 Sparks alone**. That layer, its tools and its numbers live in [`fabric/`](fabric/README.md). None of it exists without MCDMA;
 Ben's MelonDMA told us what the Gen3 tunnel would do before we had one.
 
+## Since 9/18
+
+Three things, each with its own README, numbers and honest limits:
+
+- **[KV return](studio/kv_return/README.md)** (2026-09-18, `PD_KV_RETURN=1`, default off). The second turn of a
+  conversation no longer re-prefills the whole prompt on the Sparks: vLLM's prefix cache skips what it still holds
+  and the capture hook resumes from a small saved per-layer state. Bit-exact against a one-shot capture on CPU
+  (115 checks). One live two-turn needle run at 68K→77K tokens: Spark engine **33.7 s → 5.4 s**, door total
+  **47–50 s → 16.9–17.7 s**, needle exact.
+- **[glm53-flash-split](glm53-flash-split/README.md)** (2026-10-03/04). A second model and a second decode engine:
+  GLM-5.3-Flash prefilled on a GB10 pair, its state carried over the MCDMA door by **Ash Hart's** handoff kit, and
+  turned into **TensorFold**'s own caches on a Mac Studio. 33,903 tokens: first word **23.1 s** (Sparks alone
+  21.1 s, TensorFold alone 59.7 s), decode **45–50 tok/s** (Sparks ~20). Follow-up turn 0.19 s.
+- **[flashpp](flashpp/README.md)** (2026-10-05). The model split by *layers* instead of by phase: the same MLX code
+  on a GB10 under MLX-CUDA and on an M3 Ultra under Metal, hidden state over TCP. Token-exact against Metal alone on an 8-layer stub;
+  GLM-5.3-Flash at **19.8 tok/s**, and full GLM-5.3 coherent across three GB10s + one M3 Ultra at **3.95 tok/s**
+  (a correctness proof, not a speed result). Along the way: MLX-CUDA problems on GB10 — two with workarounds, one reported but not re-checked.
+
+Also on this branch: every launcher and `fabric/` script takes its addresses from config/env (no hosts baked in).
+
 
 ---
 
@@ -239,6 +259,10 @@ docs/     DESIGN-v3-pooled.md — the pooling math and the hook points, derived 
           FINDING-stale-limits-after-a-window-change.md — READ THIS BEFORE RAISING YOUR WINDOW.
               Five numbers sized against the old window that break silently after you raise it,
               including the one that clamps every long-context answer to a single token.
+
+glm53-flash-split/  GLM-5.3-Flash: Spark-pair prefill -> MCDMA door -> TensorFold decode (tf_split.py hook, bench, results)
+flashpp/            layer-split pipeline across MLX-CUDA and MLX-Metal (stage server, driver, MLX-CUDA patches, repros)
+studio/kv_return/   KV return, decoder side (+ spark/capture_sitecustomize_v3.kvreturn.py, spark/test_kv_return.py)
 ```
 
 ## Don't have this hardware? Start on the rung you can reach
@@ -446,5 +470,11 @@ the same hardware and a warm engine on both legs.
 oMLX for the decoder and its cache format; the vLLM DeepSeek-V4 plugin and the sparkrun GB10 image;
 EXO Labs, whose DGX Spark + Mac Studio prefill/decode result set the reference point this builds on;
 and the Spark↔Mac USB4/RDMA work that made joining the two silicon families look worth trying.
+
+Since 9/18: **Ash Hart** — [MCDMA](https://github.com/ashhart/MCDMA), [TensorFold](https://github.com/ashhart/TensorFold)
+and the GLM-5.3-Flash handoff kit (`Glm53HandoffConnector`, handoff daemon, `glm53_split`) that the split stands on;
+**Benjamin Ostrov ([@b-ostrov](https://github.com/b-ostrov))** — kv mode (PR #1);
+**[MiaAI-Lab](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks)** — the GLM-5.3-Flash EXL3 two-Spark
+vLLM recipe; vLLM, MLX (and its CUDA backend), oMLX, and `mlx-community` for the GLM-5.3 conversion.
 
 Apache-2.0.

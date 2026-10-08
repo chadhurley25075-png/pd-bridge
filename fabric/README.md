@@ -5,7 +5,7 @@ changed when a Mac Studio joined the Sparks' RoCE fabric through a switch and th
 started carrying the same blocks. It is the difference between *one Spark pair → one Mac* and a **ring**:
 
 ```
-spark-a + spark-b  ──prefill──▶  capture  ──MCDMA RDMA WRITE (MikroTik CRS812)──▶  S1 (the door)  ──assemble──▶  oMLX blocks
+Spark pair (TP2)     ──prefill──▶  capture  ──MCDMA RDMA WRITE (MikroTik CRS812)──▶  S1 (the door)  ──assemble──▶  oMLX blocks
                                                                                      S1 blocks ──TB5 RDMA (UC SEND)──▶  S2 (the library, 512 GB) ──▶ decodes
                                                                                      S2's reply blocks ──TB5 RDMA──▶ S1        (both Studios hold the conversation)
                                                         reply text ──▶ next prompt ──▶ Sparks prefill again  (KV return arrow: not yet)
