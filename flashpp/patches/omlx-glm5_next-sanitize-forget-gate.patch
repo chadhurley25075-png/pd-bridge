@@ -1,0 +1,11 @@
+--- a/omlx/patches/mlx_vlm_glm5_next_compat/vendor/mlx_vlm/models/glm5_next/language.py
++++ b/omlx/patches/mlx_vlm_glm5_next_compat/vendor/mlx_vlm/models/glm5_next/language.py
+@@ -933,7 +933,7 @@
+ 
+         remapped = {}
+         conv_parts = {}
+-        fg_parts = ("A_log", "dt_bias", "f_a_proj.weight", "f_b_proj.weight")
++        fg_parts = ("A_log", "dt_bias", "f_a_proj.weight", "f_b_proj.weight", "f_a_proj.scales", "f_a_proj.biases", "f_b_proj.scales", "f_b_proj.biases")  # flashpp: quantized forget-gate projections move too
+         for k, v in weights.items():
+             nk = k.replace(".hc_attn_", ".attn_hc.").replace(".hc_ffn_", ".ffn_hc.")
+ 
