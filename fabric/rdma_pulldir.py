@@ -6,7 +6,7 @@ import subprocess,sys,json,os,time,argparse,tarfile,io
 ap=argparse.ArgumentParser(); ap.add_argument("spark_ssh"); ap.add_argument("spark_dir"); ap.add_argument("local_dir")
 ap.add_argument("--spark-dev",default="rocep1s0f0"); ap.add_argument("--spark-gid",default="1")
 ap.add_argument("--mac-dev",default="rdma_mcrdma0"); ap.add_argument("--mac-gid",default="0")
-ap.add_argument("--spark-bin",default="/home/chad-hurley/bin/rdma_file"); ap.add_argument("--mac-bin",default=os.path.expanduser("~/bin/rdma_file"))
+ap.add_argument("--spark-bin",default="~/bin/rdma_file"); ap.add_argument("--mac-bin",default=os.path.expanduser("~/bin/rdma_file"))
 a=ap.parse_args(); t_all=time.time()
 # 1) Spark: tar the dir's regular files (skip DONE/seg_*) into /dev/shm, report size
 tarcmd=(f"cd {a.spark_dir} && find . -maxdepth 1 -type f ! -name DONE ! -name 'seg_*' -printf '%P\\n' | sort | "

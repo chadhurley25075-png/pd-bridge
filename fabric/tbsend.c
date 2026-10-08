@@ -2,7 +2,7 @@
  * receiver: tbsend recv DEVICE GID_IDX OUTFILE            -> prints "ENDPOINT gid qpn psn" then waits
  * sender:   tbsend send DEVICE GID_IDX INFILE < endpoint  -> connects, streams file in <=16MB chunks
  * Both print TBRESULT bytes=.. seconds=.. gbit=.. ; receiver also prints sha256 prefix.
- * Compass 2026-09-18. Apache-2.0. */
+ * pd-bridge 2026-09-18. Apache-2.0. */
 #include <infiniband/verbs.h>
 #include <arpa/inet.h>
 #include <stdio.h>

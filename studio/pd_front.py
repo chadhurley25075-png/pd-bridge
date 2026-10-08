@@ -63,7 +63,7 @@ if PD_MODE!="kv":   # DV4 only; a plain-attention model needs neither the patch 
 from mlx_lm import load
 from mlx_lm.models.base import create_attention_mask
 from mlx_lm.models.cache import CacheList
-import omlx_block_writer  # sister B's writer: write_blocks(cache_list, token_ids, model_name, out_dir) -> paths
+import omlx_block_writer  # the block writer: write_blocks(cache_list, token_ids, model_name, out_dir) -> paths
 
 try: PD_MODEL_TYPE=json.load(open(os.path.join(PD_MODEL,"config.json"))).get("model_type") or "deepseek_v4"
 except Exception: PD_MODEL_TYPE="deepseek_v4"

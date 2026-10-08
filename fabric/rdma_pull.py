@@ -6,7 +6,7 @@ import subprocess,sys,json,time,os,argparse
 ap=argparse.ArgumentParser(); ap.add_argument("spark_ssh"); ap.add_argument("spark_path"); ap.add_argument("local_path")
 ap.add_argument("--spark-dev",default="rocep1s0f0"); ap.add_argument("--spark-gid",default="1")
 ap.add_argument("--mac-dev",default="rdma_mcrdma0"); ap.add_argument("--mac-gid",default="0")
-ap.add_argument("--spark-bin",default="/home/chad-hurley/bin/rdma_file"); ap.add_argument("--mac-bin",default=os.path.expanduser("~/bin/rdma_file"))
+ap.add_argument("--spark-bin",default="~/bin/rdma_file"); ap.add_argument("--mac-bin",default=os.path.expanduser("~/bin/rdma_file"))
 a=ap.parse_args()
 size=int(subprocess.check_output(["ssh","-o","BatchMode=yes",a.spark_ssh,f"stat -c %s {a.spark_path}"],text=True).strip())
 env=dict(os.environ,MCDMA_CQ_MAP="2",MCDMA_USER_POST="1",MCDMA_USER_BF="64")  # Ash's fast path (mapped CQ + user doorbell + BlueFlame-64)

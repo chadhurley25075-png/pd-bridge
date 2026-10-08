@@ -1,5 +1,5 @@
 # SPIDERSENSE DISTRIBUTION — multi-lane inference transport
-*Design + measured baseline. Compass (Fable seat) for Chad, 2026-09-16 night. All numbers measured tonight unless marked.*
+*Design + measured baseline. pd-bridge, 2026-09-16 night. All numbers measured tonight unless marked.*
 
 ## The idea in one paragraph
 The fleet has four kinds of wire. Don't bond them — **assign traffic to the lane built for it.** Bulk (KV, weights,
@@ -10,9 +10,9 @@ ingests from the Sparks and redistributes to peer Studios, so every Studio is fe
 ## Lanes (as wired 9/16)
 | Lane | Speed | RDMA | Notes |
 |---|---|---|---|
-| Spark↔Spark QSFP RoCE (.220.x) | 200G | yes | 7 Sparks + Cerebro, flat L2 across m1/m2 (200G ISL) |
+| Spark↔Spark QSFP RoCE (.220.x) | 200G | yes | 8 Sparks, flat L2 across m1/m2 (200G ISL) |
 | Spark→Studio door (Sonnet + CX-4 Lx) | **26.4G** iperf / 23G single HTTP | after SIP | S1 live (.220.21). 3 CX-5 Ex cards inbound → ~38G each |
-| Spark 10GbE → Studio 10GbE (Omada LAN) | 9.3G | no | every node |
+| Spark 10GbE → Studio 10GbE (house LAN) | 9.3G | no | every node |
 | Studio↔Studio TB5 mesh (rdma_en*, jaccl) | 80G RDMA link; **18.4G TCP** measured | yes (jaccl) | S1–S4 K4-ish mesh; TCP over it is kernel-limited |
 
 ## Measured tonight (4,057 MiB payload = Ash's largest KV)
@@ -45,7 +45,7 @@ ingests from the Sparks and redistributes to peer Studios, so every Studio is fe
 4. After SIP + MelonDMA: door hop becomes RDMA too (≈9 µs) → end-to-end RDMA Spark→door→any Studio.
 
 ## Gotchas learned tonight
-- en16 grabbed a DHCP lease + default route from Omada over the flat bridge. Set Manual BEFORE link-up on S3/S4.
+- en16 grabbed a DHCP lease + default route from the house router over the flat bridge. Set Manual BEFORE link-up on S3/S4.
 - Deleting routes on macOS: `route delete -net X -ifscope IF` can remove the on-link route too. Verify `route get` after.
 - Studio TB5 links carry only link-local by default; add /30 aliases for TCP tests, remove after.
 - CNS bus caps a command at 30s — split long benches.

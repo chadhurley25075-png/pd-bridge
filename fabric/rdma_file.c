@@ -5,7 +5,7 @@
  *   recv: rdma_file recv DEV GID_IDX OUT_PATH NBYTES        -> prints "EP gid qpn psn rkey addr", waits, lands, prints RESULT
  *   send: rdma_file send DEV GID_IDX IN_PATH  < EP-line     -> prints "EP gid qpn psn", RDMA-WRITEs the file, prints RESULT
  * Region is registered as a pool of <=4 MiB MRs on the Mac (MCDMA translator cap); sender streams 1 MiB WRITEs,
- * depth 7, then a final WRITE_WITH_IMM as the completion marker. Compass 2026-09-18, Apache-2.0. */
+ * depth 7, then a final WRITE_WITH_IMM as the completion marker. pd-bridge 2026-09-18, Apache-2.0. */
 #include <infiniband/verbs.h>
 #include <arpa/inet.h>
 #include <stdio.h>
