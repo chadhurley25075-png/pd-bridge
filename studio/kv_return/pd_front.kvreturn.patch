@@ -1,0 +1,67 @@
+--- a/studio/pd_front.py
++++ b/studio/pd_front.py
+@@ -15,6 +15,14 @@
+ import threading, queue as _queue
+ import urllib.request
+ import mlx.core as mx
++# 2026-09-18 KV RETURN (PD_KV_RETURN=1, default off): kv_return/pd_kv_return.py — push the parent's
++# kvstate back to the Spark before the engine call, accept a resumed capture, merge its prefix from the kept parent.
++sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "kv_return"))
++try:
++    import pd_kv_return as KVR
++except Exception as _e:
++    KVR=None
++PD_KV_RETURN=os.environ.get("PD_KV_RETURN","0")=="1" and KVR is not None
+ 
+ PD_MODEL=os.environ.get("PD_MODEL", os.path.expanduser("~/models/DV4-Flash-MXFP4-MLX"))
+ PD_MODEL_NAME=os.environ.get("PD_MODEL_NAME","DV4-Flash-MXFP4-MLX")
+@@ -271,6 +279,8 @@
+ def _cap_usable_prefix(man):
+     """Tokens of contiguous-from-0 capture data this manifest promises. 0 = untrustworthy (a mid-request
+     flush fragment or a capture with position gaps can't seed blocks from token 0)."""
++    if PD_KV_RETURN and man.get("partial_start") and (man.get("kv_return") or {}).get("resume_from"):
++        return KVR.usable_prefix(man)            # resumed capture: complete from 0 after merge_prefix (parent must match)
+     if man.get("partial_start"): return 0
+     if man.get("position_gaps"): return 0
+     return int(man.get("T") or 0)
+@@ -287,6 +297,9 @@
+     base=PD_SPARK.rsplit(":",1)[0]+f":{PD_SHARE_PORT}"; T=len(ids)
+     before={e["name"] for e in _ls(base) if e["dir"]}
+     tm={"t0":time.time(),"transport":PD_TRANSPORT}; eng={}
++    if PD_KV_RETURN:
++        tm["kv_return_push"]=KVR.push_state(PD_SPARK_SSH, PD_SPARK_CAPDIR)   # parent state on the Spark BEFORE the engine sees the prompt
++        tm["t_kv_push"]=round(time.time()-tm["t0"],2)
+     def _engine():
+         body=json.dumps({"model":PD_SPARK_MODEL,"prompt":ids,"max_tokens":1,"temperature":0}).encode()
+         try:
+@@ -364,6 +377,16 @@
+                     if not b: break
+                     f.write(b); pulled+=len(b)
+     tm["t_pulled"]=round(time.time()-tm["t0"],2); tm["pulled_gb"]=round(pulled/1e9,3)
++    man_kvr=None
++    if PD_KV_RETURN:
++        try:
++            man_kvr=json.load(open(os.path.join(local,"manifest.json")))
++            if (man_kvr.get("kv_return") or {}).get("resume_from"):
++                tm["kv_return_merge"]=KVR.merge_prefix(local, man_kvr)
++                if not tm["kv_return_merge"].get("merged"): raise RuntimeError(f"bridge declined: resumed capture {stamp} could not be merged ({tm['kv_return_merge']})")
++                tm["t_kv_merged"]=round(time.time()-tm["t0"],2)
++        except RuntimeError: raise
++        except Exception as ex: L(f"bridge: kv_return manifest/merge step skipped ({ex!r})")
+     paths,ainfo=assemble_and_write(local, ids, MODEL, PD_MODEL_NAME, PD_CACHE_DIR)
+     th.join(timeout=60)
+     tm.update({"t_engine":round(eng.get("t",-1),2),"t_assembled":round(time.time()-tm["t0"],2),
+@@ -375,8 +398,11 @@
+     full_B=(T//PD_BLOCK)*PD_BLOCK  # B<full_B means genuinely missing boundaries; B==full_B with a sub-boundary tail is the NORMAL complete case (oMLX prefills the tail natively by design)
+     if ainfo["B"]<full_B: verdict=f"partial {ainfo['B']}/{T}"
+     tm["verdict"]=verdict
+-    try: shutil.rmtree(local)
+-    except Exception: pass
++    if PD_KV_RETURN and verdict=="complete":
++        tm["kv_return_kept"]=KVR.remember(stamp, local, T, man_kvr)   # keep as the merge parent for the next turn
++    if not (PD_KV_RETURN and tm.get("kv_return_kept",{}).get("kept")):
++        try: shutil.rmtree(local)
++        except Exception: pass
+     return paths, tm
+ 
+ def spark_prefill_stream(ids):
