@@ -77,9 +77,9 @@ Three things, each with its own README, numbers and honest limits:
   turned into **TensorFold**'s own caches on a Mac Studio. 33,903 tokens: first word **23.1 s** (Sparks alone
   21.1 s, TensorFold alone 59.7 s), decode **45–50 tok/s** (Sparks ~20). Follow-up turn 0.19 s.
 - **[flashpp](flashpp/README.md)** (2026-10-05). The model split by *layers* instead of by phase: the same MLX code
-  on a GB10 under MLX-CUDA and on an M3 Ultra under Metal, hidden state over TCP. Token-exact against Metal alone;
+  on a GB10 under MLX-CUDA and on an M3 Ultra under Metal, hidden state over TCP. Token-exact against Metal alone on an 8-layer stub;
   GLM-5.3-Flash at **19.8 tok/s**, and full GLM-5.3 coherent across three GB10s + one M3 Ultra at **3.95 tok/s**
-  (a correctness proof, not a speed result). Along the way, three MLX-CUDA problems on GB10 with workarounds.
+  (a correctness proof, not a speed result). Along the way: MLX-CUDA problems on GB10 — two with workarounds, one reported but not re-checked.
 
 Also on this branch: every launcher and `fabric/` script takes its addresses from config/env (no hosts baked in).
 

@@ -28,8 +28,8 @@ layer — the rows just before `S`:
 
 vLLM resumes at a 256-aligned `S` (block size 256) or at `T-1` (fully cached prompt), so the hook keeps
 `PD_KV_RETURN_KEEP=256` extra rows. The state is written per finished capture as
-`<stamp>/kvstate.safetensors` + `kvstate.json` (≈75 MB for 43 layers — an estimate scaled from the 4-layer
-test, not a measured file size). The decoder then *merges*: `pooled = cat(parent.pooled[:S//ratio], new.pooled)`,
+`<stamp>/kvstate.safetensors` + `kvstate.json` (≈75 MB for 43 layers estimated from row counts; the 4-layer
+test scaled to 47 MB — not a measured file size). The decoder then *merges*: `pooled = cat(parent.pooled[:S//ratio], new.pooled)`,
 boundary snapshots `≤ S` from the parent, everything after `S` from the new capture — and the normal
 assemble/write runs on a capture that is complete from token 0.
 
@@ -79,7 +79,8 @@ Needle test straight to the door (`:8012`), seed 921: turn 1 = 68,289 tokens wit
 | **ring total** | 358–460 s (fell back to door decode — see limits) | **48.5 s** |
 
 Same morning, warm turns without KV return: first token 36–62 s. The Spark column is the point: at 68K the
-second turn's prefill went 33.7 s → 5.4 s, and it scales with the *new* tokens, not the conversation.
+second turn's prefill went 33.7 s → 5.4 s, and it should scale with the *new* tokens, not the conversation
+(expected from the mechanism; one run does not prove the scaling).
 
 ## Honest limits
 
