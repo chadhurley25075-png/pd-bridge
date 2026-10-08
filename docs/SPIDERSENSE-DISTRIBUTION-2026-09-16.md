@@ -11,7 +11,7 @@ ingests from the Sparks and redistributes to peer Studios, so every Studio is fe
 | Lane | Speed | RDMA | Notes |
 |---|---|---|---|
 | Spark↔Spark QSFP RoCE (.220.x) | 200G | yes | 8 Sparks, flat L2 across m1/m2 (200G ISL) |
-| Spark→Studio door (Sonnet + CX-4 Lx) | **26.4G** iperf / 23G single HTTP | after SIP | S1 live (.220.21). 3 CX-5 Ex cards inbound → ~38G each |
+| Spark→Studio door (Sonnet + CX-4 Lx) | **26.4G** iperf / 23G single HTTP | after SIP | S1 live (fabric address). 3 CX-5 Ex cards inbound → ~38G each |
 | Spark 10GbE → Studio 10GbE (house LAN) | 9.3G | no | every node |
 | Studio↔Studio TB5 mesh (rdma_en*, jaccl) | 80G RDMA link; **18.4G TCP** measured | yes (jaccl) | S1–S4 K4-ish mesh; TCP over it is kernel-limited |
 
@@ -48,4 +48,4 @@ ingests from the Sparks and redistributes to peer Studios, so every Studio is fe
 - en16 grabbed a DHCP lease + default route from the house router over the flat bridge. Set Manual BEFORE link-up on S3/S4.
 - Deleting routes on macOS: `route delete -net X -ifscope IF` can remove the on-link route too. Verify `route get` after.
 - Studio TB5 links carry only link-local by default; add /30 aliases for TCP tests, remove after.
-- CNS bus caps a command at 30s — split long benches.
+- fleet command bus caps a command at 30s — split long benches.

@@ -48,7 +48,7 @@ KL over the prefill engine's own top-20 next-token distribution — **split 0.02
 top-1 identical for both. The split is *closer* to the reference than the decoder's own reading of the same
 tokens. What remains is quantization: EXL3 4 bpw on the Sparks vs MLX 4-bit on the Studio, so the per-layer
 latent differs from TensorFold's own by 0.10 relative L2 at layer 3, rising (not monotonically) to 0.38 at layer 43. Every
-alternative layout and a ±1 position shift were checked and are far worse (≥1.0), so this is not a layout bug —
+alternative layout that ran, and a ±1 position shift, came out far worse (≥1.0), so this is not a layout bug —
 but it does mean **split output is not token-identical to either engine alone.**
 
 **Lock step.** One stream decoding while a 34K split ran: worst inter-chunk gap on the decoding stream 0.18 s,
@@ -126,7 +126,7 @@ the split.
   against it. Expect it to break.
 - **Depends on a kit that was not public** (Ash Hart's handoff connector, daemon and `glm53_split`).
 - **One pair, one door, one puller.** A single lock serializes pulls on the MCDMA device.
-- **Measured over two nights on one setup.** No error bars; the soak and the overnight probes are the
+- **Measured over one night and the following morning, on one setup.** No error bars; the soak and the overnight probes are the
   repeatability evidence we have.
 - `frozen_marker_ids` (keep a TensorFold checkpoint where a long fixed prefix ends) is off by default; it was
   built for a 700K-token fixed prefix and is described, not benchmarked, here.

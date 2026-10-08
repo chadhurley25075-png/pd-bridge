@@ -19,7 +19,7 @@ a machine never stores layers it does not run.
 |---|---|---|
 | split logic, one box | GLM-5.3-Flash 8-layer stub: 1 stage vs 2 stages on one GB10 | **identical 12 tokens** |
 | cross-family exactness | same stub: CUDA layers 0–3 → Metal 4–7 + head, vs Metal only | **identical 12 tokens** |
-| **full GLM-5.3-Flash** (45 layers) | GB10 (CUDA) layers 0–5 → M3 Ultra 256 GB (Metal) layers 6–44 + head | coherent English · **19.8 tok/s decode** · prefill 29 tokens in 2.23 s · per token: CUDA stage 13.0 ms, Metal stage 28.8 ms, ~3 ms network+overhead |
+| **full GLM-5.3-Flash** (45 layers) | GB10 (CUDA) layers 0–5 → M3 Ultra 256 GB (Metal) layers 6–44 + head | coherent English · **19.8 tok/s decode** · prefill 29 tokens in 2.23 s · per token: CUDA stage 13.0 ms, Metal stage 28.8 ms (~3 ms TCP network; ~9 ms per token in total outside the two stages' compute) |
 | **full GLM-5.3** (78 layers, `glm_moe_dsa`, `mlx-community` indexerBF16-q4) | 3× GB10 (CUDA) layers 0–9 / 10–25 / 26–41 → M3 Ultra 256 GB (Metal) layers 42–77 + head | coherent ("The capital of France is Paris. Famous landmarks include the Eiffel Tower, the Louvre, Notre-Dame…") · **3.95 tok/s decode** · prefill 32 tokens in 3.84 s · per token 33.3 / 46.9 / 47.6 / 49.6 ms compute per stage |
 | the same 4 stages, earlier that evening | before the last MLX-CUDA workaround | **garbled** output (kept: `glm53_full_4stage_earlier_garbled_…json`) |
 
@@ -87,7 +87,7 @@ share the previous layer's top-k (IndexShare) cannot start a stage; `DsaStage` r
 
 ## Status, honestly
 
-- **Correctness proven on short prompts only** (12–60 greedy tokens, prompts of 20–32 tokens). No long-context,
+- **Correctness proven on short prompts only** (12–60 greedy tokens, the full-model runs used 29- and 32-token prompts). No long-context,
   no quality eval, no needle test through the pipeline.
 - **Slow by design of this version:** one request at a time, no pipelining, plain TCP, CUDA fallbacks. The
   speed levers we listed (and later partly pursued outside this folder) are an RDMA hop, compiled/native CUDA
