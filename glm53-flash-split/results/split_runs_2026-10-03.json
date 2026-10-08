@@ -3,7 +3,7 @@
  "model": "GLM-5.3-Flash",
  "notes": [
   "Endpoints: tags 'sparks-alone-*' = the prefill pair's own vLLM endpoint (prefill + decode on the Sparks); every other row = TensorFold on the decode Studio, with the split on unless the tag says 'tf-alone'.",
-  "Answer text is omitted: the document was built from private notes. needle_ok = the answer named the needle's colour and day.",
+  "Answer text is omitted: the document was private text. needle_ok = the answer named the needle's colour and day.",
   "'lockstep-split-32k' ran while another stream was decoding, before the scheduler fix (decode 6.5 tok/s); 'lockstep2' after the first fix; 'LS3/LS4' are the lock-step runs after the two-phase fix; 'gap-A' is the concurrent decode stream's inter-chunk gaps during LS4.",
   "'split-100k' = before the 256 KB door-read fix (186.6 s); 'split-100k-chunk256' = after (73.8 s).",
   "'conc*' = two splits submitted together; 'collide-drift-100k' = a split while another consumer captured on the same pair.",
