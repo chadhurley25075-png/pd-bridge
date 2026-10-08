@@ -1,0 +1,11 @@
+--- a/omlx/patches/glm_moe_dsa/deepseek_v32.py
++++ b/omlx/patches/glm_moe_dsa/deepseek_v32.py
+@@ -233,6 +233,8 @@
+ 
+         offset = cache.offset if cache is not None else 0
+ 
++        # flashpp: MLX-CUDA rope is unreliable on strided views (GB10, mlx 0.32.0)
++        q, k = mx.contiguous(q), mx.contiguous(k)
+         q = self.rope(q, offset=offset)
+         k = self.rope(k, offset=offset)
+ 

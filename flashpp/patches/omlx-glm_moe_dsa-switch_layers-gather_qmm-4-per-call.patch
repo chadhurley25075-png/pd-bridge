@@ -1,0 +1,23 @@
+--- a/omlx/patches/glm_moe_dsa/switch_layers.py
++++ b/omlx/patches/glm_moe_dsa/switch_layers.py
+@@ -86,6 +86,20 @@
+         return self.weight.shape[0]
+ 
+     def __call__(self, x, indices, sorted_indices=False):
++        if mx.cuda.is_available():
++            # flashpp 10/5: MLX-CUDA 0.32.0 on GB10 returns wrong rows from gather_qmm once >=8 (x row, expert)
++            # pairs go in one call at K=6144 (GLM-5.3 gate_up); <=4 per call is exact. Feed it 4 pairs at a time.
++            bshape = mx.broadcast_shapes(x.shape[:-2], indices.shape)
++            xf = mx.broadcast_to(x, bshape + x.shape[-2:]).reshape(-1, *x.shape[-2:])
++            idf = mx.broadcast_to(indices, bshape).reshape(-1)
++            outs = [mx.gather_qmm(xf[i:i + 4], self["weight"], self["scales"], self.get("biases"),
++                                  rhs_indices=idf[i:i + 4], transpose=True, group_size=self.group_size,
++                                  bits=self.bits, mode=self.mode, sorted_indices=sorted_indices)
++                    for i in range(0, idf.shape[0], 4)]
++            x = mx.concatenate(outs, axis=0).reshape(*bshape, *outs[0].shape[-2:])
++            if "bias" in self:
++                x = x + mx.expand_dims(self["bias"][indices], -2)
++            return x
+         x = mx.gather_qmm(
+             x,
+             self["weight"],
