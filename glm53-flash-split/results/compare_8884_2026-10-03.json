@@ -1,0 +1,103 @@
+{
+ "T": 8884,
+ "latent": {
+  "median": 0.2876,
+  "max": 0.3818
+ },
+ "pool": {
+  "median": 0.1527,
+  "max": 0.1884
+ },
+ "conv": {
+  "median": 0.1716,
+  "max": 0.232
+ },
+ "ssm": {
+  "median": 0.2038,
+  "max": 0.309
+ },
+ "alt": {
+  "conv_last": {
+   "median": 1.0,
+   "max": 1.3808
+  },
+  "conv_first": {
+   "median": 0.1716,
+   "max": 0.232
+  },
+  "rec_T": {
+   "median": 1.4198,
+   "max": 1.4417
+  },
+  "pool_norot": {
+   "median": 1.4181,
+   "max": 1.4738
+  },
+  "pool_inter": {
+   "median": null,
+   "max": null
+  }
+ },
+ "latent_detail": {
+  "layer": 3,
+  "first128": 0.098,
+  "last128": 0.1031,
+  "shift+1": 1.2044,
+  "shift-1": 1.2052,
+  "norm_ratio": 1.0002
+ },
+ "latent_by_layer": {
+  "3": 0.1,
+  "7": 0.171,
+  "11": 0.142,
+  "15": 0.197,
+  "19": 0.315,
+  "23": 0.356,
+  "27": 0.364,
+  "31": 0.255,
+  "35": 0.288,
+  "39": 0.312,
+  "43": 0.382
+ },
+ "ssm_first_layers": {
+  "0": 0.074,
+  "1": 0.124,
+  "2": 0.114,
+  "4": 0.102,
+  "5": 0.148,
+  "6": 0.158
+ },
+ "next_token": {
+  "kl_local_vs_spark": 0.04404,
+  "top1_same": true,
+  "top5_overlap": 3
+ },
+ "native": {
+  "spark_native_top5": [
+   369,
+   382,
+   1588,
+   11,
+   13
+  ],
+  "split_top5": [
+   369,
+   11,
+   382,
+   1588,
+   304
+  ],
+  "local_top5": [
+   369,
+   11,
+   382,
+   1959,
+   13
+  ],
+  "top1_split_eq_native": true,
+  "top1_local_eq_native": true,
+  "kl20_split_vs_native": 0.02571,
+  "kl20_local_vs_native": 0.0601
+ },
+ "_note": "tf_split compare mode, 2026-10-03, 8,884-token prompt: relative L2 of the handed-off state vs TensorFold's own prefill per component; kl20_* = KL over the prefill engine's (vLLM) own top-20 next-token distribution. alt.* = alternative layouts tried and rejected (1.0+ = wrong layout)."
+}

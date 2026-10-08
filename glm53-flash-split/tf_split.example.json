@@ -1,0 +1,11 @@
+{"mode": "on",
+ "url": "http://PREFILL_HEAD:8888/v1", "model": "glm-5.3-flash",
+ "peers": ["PREFILL_RANK0", "PREFILL_RANK1"],
+ "socket": "/tmp/handoffd.sock", "remote_dir": "/dev/shm/glm53-handoff",
+ "min_tokens": 4096, "min_delta": 4096,
+ "max_handoff_tokens": 100000, "big_handoff_tokens": 40000,
+ "timeout_s": 900, "min_spark_tok_s": 600,
+ "conv_columns": "first",
+ "frozen_marker_ids": [], "frozen_marker_back": 0,
+ "peer_capture_marker": "/tmp/drift_capture_active",
+ "log": "~/.glm53/tf_split.log"}
