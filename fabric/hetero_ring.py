@@ -42,7 +42,7 @@ def spark_generate(prompt,max_tokens):
 if __name__=="__main__":
     seed=open(sys.argv[1]).read() if len(sys.argv)>1 and sys.argv[1] else ""
     turns=int(sys.argv[2]) if len(sys.argv)>2 else 3; add_chars=int(sys.argv[3]) if len(sys.argv)>3 else 60000
-    vol=open(os.environ["RING_DOC"],errors='replace').read(); cursor=int(len(vol)*0.5)   # any long text; ours was a private journal
+    vol=open(os.environ["RING_DOC"],errors='replace').read(); cursor=int(len(vol)*0.5)   # any long text file
     ssh(S1,'touch /tmp/.ring_marker')
     history=[]; convo_text=seed
     for k in range(1,turns+1):
