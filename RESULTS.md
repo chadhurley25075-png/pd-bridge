@@ -329,7 +329,7 @@ the slow runs were this bug. The 25.5 s sample was genuine.
 - **The quality eval is five questions on one document.** Bridged 5/5 twice is evidence the cache is
   faithful, not a benchmark suite. Prefill uses FP8 weights and decode uses MXFP4, so bridged output is
   not token-identical to native.
-- **Warm turns gain nothing**, by design.
+- **Warm turns gain nothing**, by design (the opt-in exception is `PD_KV_RETURN=1`, below).
 - **Single stream only** (`--max-num-seqs 1`). No concurrency numbers.
 - **Small n.** ~80K has three cold bridged samples, ~100K two, ~20–25K two at different token counts.
   The protocol asks for 3 seeds per size in one sitting; bench6 is one seed per size.
@@ -341,6 +341,17 @@ the slow runs were this bug. The 25.5 s sample was genuine.
 - The two legs of each pair use different seeds and therefore differ slightly in token count
   (≤0.3%). That is deliberate — reusing a seed would warm the decoder's cache and invalidate the
   cold baseline.
+
+## KV return — one live measurement, nothing newer (as of 2026-10-16)
+
+`PD_KV_RETURN=1` (merged 2026-10-07) has exactly one live measurement, taken 2026-09-18 and written up in
+`studio/kv_return/README.md`: one two-turn needle run, turn 1 = 68,289 tokens, turn 2 = +8,850 new tokens,
+Spark pair TP2 → door Studio. The Spark engine's second-turn prefill went **33.7 s → 5.4 s** and the door
+total **47–50 s → 16.9–17.7 s**; the needle came back exact. That is n = 1 at one size. The 2026-10-07
+re-run of the CPU proof (`spark/test_kv_return.py`, 115 checks, `RESULT: PASS`) is a unit test on four
+layers and carries no timing. No warm-turn number has been measured since 9/18, and none should be read
+into this table until there is one. When there is, check it against a cold bridge of the same prompt
+first (`docs/FINDING-chunk-boundary-certify.md`, last section).
 
 ## Superseded
 
