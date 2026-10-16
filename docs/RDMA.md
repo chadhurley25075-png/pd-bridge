@@ -186,3 +186,20 @@ Bridge overhead = TTFT − engine time, through the front door at ~33K tokens:
   The stage reads a small slice of every buffer every 0.5 s; single-element reads or unrelated GPU work do not help.
 - On a GB10, `max_num_batched_tokens` 16K/32K, `torch.compile`, FLASHINFER and online FP8 weights did not beat eager
   FLASH_ATTN at 8,192; FP8 was ~45% slower.
+
+### Memory-region size on the Mac side — a data point, not a law (2026-10-07)
+
+Separate verbs testing on a different Mac driver — [MCDMA](https://github.com/ashhart/MCDMA) 0.1.18 (kext), a
+ConnectX-4 Lx in a Thunderbolt enclosure on an M3 Ultra, GB10 on the other end — found `ibv_reg_mr` on the Mac
+unreliable above 4 MiB: 4 MiB registered every time; 16 MiB registered once and returned `EIO` the next time
+(16 MiB + a 16 KiB guard = 1,025 pages); 64 MiB returned `EIO` every time. Streaming a 919 MiB payload through
+one reused 4 MiB slot was fine (WRITE 26.7 Gb/s, READ 22.7 Gb/s, 0 errors, sha256 round trip exact), and striping
+to 4 QPs added only +1 % / +8 %. What *was* expensive was opening a fresh QP + MR per 4 MiB transfer instead of
+reusing one slot: ~0.43 s of setup each, so a 70 MB frame moved in 6–9 s per direction (0.07 Gb/s wall) on a
+25 Gb/s link. Register once, reuse the slot, stream.
+
+**The caveat:** the path in this repo does not show this. `pd_rdma recvd` on MelonDMA (DriverKit) registers one
+128 MiB arena and lands 64 MiB Qwen3-32B blocks in it, and every number in the table above was measured that
+way; MelonDMA allows 512 MiB pinned per user client. So this is specific to that driver and version, not a
+property of RoCE on a Mac. It is recorded for anyone who hits a coin-flip registration or `EIO` from
+`ibv_reg_mr`: shrink the region to ≤ 4 MiB and stream through it before suspecting the link.

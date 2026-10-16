@@ -130,6 +130,10 @@ a bridge-written block can never be byte-identical as a *file*.
 
 ## Known limits — read this before you run it
 
+First limit: it may not be for you at all — see *When NOT to use this* below (one box that fits the model
+beats any pipeline). Then, if you reuse captured state across engine restarts, read
+`docs/FINDING-warm-capture.md` and `docs/FINDING-chunk-boundary-certify.md` before trusting a frame.
+
 ### The memory floor, and why big prompts come back `partial` (2026-09-08)
 
 The capture lives in the prefill box's memory for the whole request and costs about **11.8 KB of
@@ -212,6 +216,19 @@ This is a **reference implementation, not a library.** It is pinned hard and it 
 compute the *consumer's* finished cache on the *producer*, using the consumer's weights. That
 generalizes past this model and this hardware, and it is the part worth stealing.
 
+## When NOT to use this
+
+A single-stream pipeline's time is the sum of its stage times plus the hops between them; no stage runs
+faster for being in a pipeline. So a prefill/decode split (or a layer split) beats one machine **only when
+that machine cannot hold the model**, or cannot hold it with the context you need. If one box fits the
+model and the context, the bridge adds hops without adding speed: run the model there. Every headline
+number in this repo is a fit result on hardware that could not hold the model alone (DeepSeek-V4-Flash
+needs ~149 GB resident against a 128 GB GB10; full GLM-5.3 across three GB10s and a Studio), not a
+speed-over-one-box result. The one thing a split buys when both sides *could* fit the model is a faster
+engine per phase, and it still pays for the hops: `glm53-flash-split` reached the first word in 23.1 s
+against 21.1 s on the prefill pair alone, and won on decode (45–50 tok/s vs ~20). Measure that trade as
+TTFT minus engine time (`docs/RDMA.md`, *Measure*), never as TTFT alone.
+
 ---
 
 ## Layout
@@ -259,6 +276,10 @@ docs/     DESIGN-v3-pooled.md — the pooling math and the hook points, derived 
           FINDING-stale-limits-after-a-window-change.md — READ THIS BEFORE RAISING YOUR WINDOW.
               Five numbers sized against the old window that break silently after you raise it,
               including the one that clamps every long-context answer to a single token.
+          FINDING-warm-capture.md — the first long prefill after an engine boot computes differently;
+              capture state only on a warm engine, certify before serving
+          FINDING-chunk-boundary-certify.md — KV frames are exact only at the engine's prefill-chunk
+              boundaries; the certify / poison-probe / same-weights recipe
 
 glm53-flash-split/  GLM-5.3-Flash: Spark-pair prefill -> MCDMA door -> TensorFold decode (tf_split.py hook, bench, results)
 flashpp/            layer-split pipeline across MLX-CUDA and MLX-Metal (stage server, driver, MLX-CUDA patches, repros)
